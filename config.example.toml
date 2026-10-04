@@ -1,0 +1,62 @@
+# Copy to config.toml. Relative paths are relative to this file.
+
+state_dir = "state"
+timezone = "Europe/Rome"
+# reference_file = "reference.md"   # example posts to learn tone from
+
+[llm]
+base_url = "http://100.110.202.124:8080/v1"
+timeout = 1800
+concurrency = 1
+max_jobs_per_day = 150
+
+[streams]
+plan = "plan"
+drafts = "drafts"
+published = "published"
+metrics = "metrics"
+ops = "ops"
+
+[schedule]
+writing_starts = "08:00"
+publish_times = ["10:00", "14:00", "19:00"]
+min_gap_minutes = 60
+metrics_time = "23:30"
+
+[pipeline]
+posts_per_day = 3
+attempts_per_slot = 2
+max_revisions = 3
+ceo_approval = true
+max_chars = 280
+max_backlog = 6
+
+[breakers]
+bot_messages_per_hour = 30
+bot_streak_per_topic = 12
+answer_bot_mentions = false
+
+[x]
+dry_run = true
+env_file = "x.env"
+
+[personas.strategist]
+zuliprc = "strategist-zuliprc"
+thinking = true
+max_tokens = 16000
+
+[personas.writer]
+zuliprc = "writer-zuliprc"
+thinking = false
+max_tokens = 2048
+temperature = 0.9
+
+[personas.editor]
+zuliprc = "editor-zuliprc"
+thinking = true
+max_tokens = 8000
+temperature = 0.6
+
+# No LLM: posts approved drafts and records metrics.
+[personas.publisher]
+zuliprc = "publisher-zuliprc"

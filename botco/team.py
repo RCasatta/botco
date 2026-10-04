@@ -1,0 +1,122 @@
+"""The bots' Zulip accounts: sending, reading history, and listening."""
+
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+from dataclasses import dataclass
+
+import zulip
+
+from .breakers import Breakers
+from .config import Config
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class Bot:
+    persona: str
+    client: zulip.Client
+    user_id: int
+    full_name: str
+
+
+class Blocked(Exception):
+    """A circuit breaker stopped a message."""
+
+
+class Team:
+    def __init__(self, cfg: Config, breakers: Breakers):
+        self.cfg = cfg
+        self.breakers = breakers
+        self.bots: dict[str, Bot] = {}
+        for name, persona in cfg.personas.items():
+            client = zulip.Client(config_file=str(persona.zuliprc), client="botco")
+            me = client.get_profile()
+            if me.get("result") != "success":
+                raise RuntimeError(f"{name}: cannot log in to Zulip: {me.get('msg')}")
+            self.bots[name] = Bot(name, client, me["user_id"], me["full_name"])
+        self.bot_ids = {b.user_id for b in self.bots.values()}
+        self._is_bot: dict[int, bool] = {}
+
+    @property
+    def ops(self) -> zulip.Client:
+        return self.bots[self.cfg.listener].client
+
+    def names(self) -> dict[str, int]:
+        """Zulip full name -> user id, for mention parsing."""
+        return {b.full_name: b.user_id for b in self.bots.values()}
+
+    def persona_of(self, full_name_or_id: str | int) -> str | None:
+        for b in self.bots.values():
+            if full_name_or_id in (b.full_name, b.user_id):
+                return b.persona
+        return None
+
+    def is_bot(self, user_id: int) -> bool:
+        """Any bot account counts, not only ours."""
+        if user_id in self.bot_ids:
+            return True
+        if user_id not in self._is_bot:
+            r = self.ops.get_user_by_id(user_id)
+            self._is_bot[user_id] = bool(r.get("user", {}).get("is_bot", False))
+        return self._is_bot[user_id]
+
+    def setup_streams(self) -> None:
+        """Create the streams if needed and subscribe every bot and human."""
+        subs = [{"name": s} for s in self.cfg.streams.all()]
+        for bot in self.bots.values():
+            r = bot.client.add_subscriptions(streams=subs)
+            if r.get("result") != "success":
+                raise RuntimeError(f"{bot.persona}: cannot subscribe: {r.get('msg')}")
+        members = self.ops.get_members()["members"]
+        humans = [m["user_id"] for m in members if not m["is_bot"] and m.get("is_active", True)]
+        r = self.ops.add_subscriptions(streams=subs, principals=humans)
+        if r.get("result") != "success":
+            log.warning("could not subscribe humans: %s", r.get("msg"))
+
+    def send(self, persona: str, stream: str, topic: str, content: str, check: bool = True) -> int:
+        """Post as `persona`. Raises Blocked if a breaker trips."""
+        if check:
+            why = self.breakers.allow(persona, stream, topic)
+            if why:
+                raise Blocked(why)
+        r = self.bots[persona].client.send_message(
+            {"type": "stream", "to": stream, "topic": topic, "content": content}
+        )
+        if r.get("result") != "success":
+            raise RuntimeError(f"{persona}: send to #{stream} failed: {r.get('msg')}")
+        self.breakers.record(persona)
+        return r["id"]
+
+    def notify(self, text: str, topic: str = "alerts") -> None:
+        """Operational message to #ops. Never blocked: alerts must get through."""
+        try:
+            self.send(self.cfg.listener, self.cfg.streams.ops, topic, text, check=False)
+        except Exception:
+            log.exception("cannot post to #ops: %s", text)
+
+    def react(self, persona: str, msg_id: int, emoji: str) -> None:
+        self.bots[persona].client.add_reaction({"message_id": msg_id, "emoji_name": emoji})
+
+    def history(self, stream: str, topic: str | None = None, n: int = 30) -> list[dict]:
+        narrow = [{"operator": "channel", "operand": stream}]
+        if topic is not None:
+            narrow.append({"operator": "topic", "operand": topic})
+        r = self.ops.get_messages(
+            {"anchor": "newest", "num_before": n, "num_after": 0, "narrow": narrow, "apply_markdown": False}
+        )
+        return r.get("messages", [])
+
+    def listen(self, inbox: queue.Queue) -> None:
+        """Push every message and reaction event into `inbox`, from a thread.
+        The zulip library re-registers the queue after errors by itself."""
+
+        def run() -> None:
+            self.ops.call_on_each_event(
+                inbox.put, event_types=["message", "reaction"], apply_markdown=False, all_public_streams=False
+            )
+
+        threading.Thread(target=run, name="zulip-events", daemon=True).start()

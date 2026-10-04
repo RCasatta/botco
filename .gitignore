@@ -1,0 +1,10 @@
+# Secrets: Zulip bot keys and X credentials. On ripper they come from agenix.
+*zuliprc*
+*.env
+config.toml
+# Runtime state
+*.sqlite3
+state/
+result
+__pycache__/
+.direnv/

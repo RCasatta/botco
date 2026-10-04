@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "botco"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["zulip", "requests", "requests-oauthlib"]
+
+[project.scripts]
+botco = "botco.__main__:main"
+
+[tool.setuptools]
+packages = ["botco"]
+
+[tool.setuptools.package-data]
+botco = ["prompts/*.md"]
