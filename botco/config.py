@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import time
 from pathlib import Path
 
+AGENTS = ("strategist", "writer", "editor")
+
 
 @dataclass
 class Persona:
@@ -27,10 +29,9 @@ class LLMConfig:
     # Seconds a single request may take. The server can be busy with other
     # work, so this is generous: a busy server is waited for, not failed.
     timeout: int = 1800
-    # Requests in flight at once. TabbyAPI's max_batch_size is 3 and other
+    # Agent turns running at once. TabbyAPI's max_batch_size is 3 and other
     # users share it.
     concurrency: int = 1
-    max_jobs_per_day: int = 150
 
 
 @dataclass
@@ -46,33 +47,37 @@ class Streams:
 
 
 @dataclass
-class Schedule:
-    writing_starts: time = time(8, 0)
-    publish_times: list[time] = field(default_factory=lambda: [time(10, 0), time(14, 0), time(19, 0)])
+class Agents:
+    # Who handles a human message that mentions no bot.
+    coordinator: str = "strategist"
+    # Each agent gets a turn this often even when nobody called it.
+    heartbeat_minutes: int = 60
+    # Heartbeats only in this window; mentions wake agents at any time.
+    active_from: time = time(7, 30)
+    active_to: time = time(23, 0)
+    # Model calls in one turn before it is cut off.
+    max_steps: int = 10
+    # Turns per day. Past it, only turns a human asked for still run.
+    max_turns_per_day: int = 300
+    # Every tool call is logged in #ops > activity.
+    activity_log: bool = True
+
+
+@dataclass
+class Publishing:
+    times: list[time] = field(default_factory=lambda: [time(10, 0), time(14, 0), time(19, 0)])
     min_gap_minutes: int = 60
+    # A draft also needs the CEO's approval (in words or ✅) to be published.
+    ceo_approval: bool = True
+    max_chars: int = 280
     metrics_time: time = time(23, 30)
 
 
 @dataclass
-class Pipeline:
-    posts_per_day: int = 3
-    attempts_per_slot: int = 2
-    max_revisions: int = 3
-    # Approved drafts wait for the CEO's reaction before they can be published.
-    ceo_approval: bool = True
-    max_chars: int = 280
-    # Stop writing when this many approved drafts wait to be published.
-    max_backlog: int = 6
-
-
-@dataclass
 class Breakers:
-    bot_messages_per_hour: int = 30
+    bot_messages_per_hour: int = 40
     # Consecutive bot messages in one topic without a human in between.
-    bot_streak_per_topic: int = 12
-    # Bots answer @-mentions from humans; mentions between bots are ignored
-    # unless this is set.
-    answer_bot_mentions: bool = False
+    bot_streak_per_topic: int = 20
 
 
 @dataclass
@@ -87,20 +92,24 @@ class Config:
     timezone: str
     llm: LLMConfig
     streams: Streams
-    schedule: Schedule
-    pipeline: Pipeline
+    agents: Agents
+    publishing: Publishing
     breakers: Breakers
     x: XConfig
     personas: dict[str, Persona]
     # Optional file with example posts the team should learn tone and topics
     # from (never copy).
     reference_file: Path | None = None
-    # Bot whose event queue the orchestrator listens on.
-    listener: str = "publisher"
+    # The bot that publishes and posts operational messages; no LLM.
+    publisher: str = "publisher"
 
 
 def _time(s: str) -> time:
     return time.fromisoformat(s)
+
+
+def _times(raw: dict, *keys: str) -> dict:
+    return {k: _time(v) for k, v in raw.items() if k in keys} | {k: v for k, v in raw.items() if k not in keys}
 
 
 def load(path: Path) -> Config:
@@ -111,13 +120,11 @@ def load(path: Path) -> Config:
         q = Path(p)
         return q if q.is_absolute() else base / q
 
-    sched = raw.get("schedule", {})
-    schedule = Schedule(
-        writing_starts=_time(sched.get("writing_starts", "08:00")),
-        publish_times=[_time(t) for t in sched.get("publish_times", ["10:00", "14:00", "19:00"])],
-        min_gap_minutes=sched.get("min_gap_minutes", 60),
-        metrics_time=_time(sched.get("metrics_time", "23:30")),
-    )
+    pub = dict(raw.get("publishing", {}))
+    if "times" in pub:
+        pub["times"] = [_time(t) for t in pub["times"]]
+    if "metrics_time" in pub:
+        pub["metrics_time"] = _time(pub["metrics_time"])
     x = raw.get("x", {})
     personas = {
         name: Persona(
@@ -129,7 +136,7 @@ def load(path: Path) -> Config:
         )
         for name, p in raw["personas"].items()
     }
-    for required in ("strategist", "writer", "editor", "publisher"):
+    for required in (*AGENTS, "publisher"):
         if required not in personas:
             raise ValueError(f"config: missing [personas.{required}]")
     ref = raw.get("reference_file")
@@ -138,11 +145,10 @@ def load(path: Path) -> Config:
         timezone=raw.get("timezone", "Europe/Rome"),
         llm=LLMConfig(**raw.get("llm", {})),
         streams=Streams(**raw.get("streams", {})),
-        schedule=schedule,
-        pipeline=Pipeline(**raw.get("pipeline", {})),
+        agents=Agents(**_times(raw.get("agents", {}), "active_from", "active_to")),
+        publishing=Publishing(**pub),
         breakers=Breakers(**raw.get("breakers", {})),
         x=XConfig(dry_run=x.get("dry_run", True), env_file=rel(x.get("env_file", "x.env"))),
         personas=personas,
         reference_file=rel(ref) if ref else None,
-        listener=raw.get("listener", "publisher"),
     )

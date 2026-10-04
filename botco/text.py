@@ -8,7 +8,6 @@ from difflib import SequenceMatcher
 URL_RE = re.compile(r"https?://|www\.|\b[a-z0-9-]+\.(com|ai|io|org|net|dev|co|it)\b", re.IGNORECASE)
 MENTION_RE = re.compile(r"(?<![\w@])@\w{1,15}")
 HASHTAG_RE = re.compile(r"(?<!\w)#\w+")
-VERDICT_RE = re.compile(r"VERDICT:\s*\**\s*(APPROVE|REVISE|REJECT)", re.IGNORECASE)
 # Zulip markdown mentions: @**Name** or @**Name|id**; @_**...** is silent.
 ZULIP_MENTION_RE = re.compile(r"(?<!_)@\*\*([^*|]+)(?:\|(\d+))?\*\*")
 
@@ -54,15 +53,6 @@ def check_post(text: str, max_chars: int, previous: list[str]) -> list[str]:
             problems.append(f"nearly identical to an earlier post: {old[:80]!r}")
             break
     return problems
-
-
-def parse_verdict(text: str) -> tuple[str, str]:
-    """Return (approve|revise|reject, feedback). Defaults to revise when the
-    editor forgets the verdict line, so nothing is approved by accident."""
-    matches = VERDICT_RE.findall(text)
-    verdict = matches[-1].lower() if matches else "revise"
-    feedback = VERDICT_RE.sub("", text).strip()
-    return verdict, feedback
 
 
 def mentioned(content: str, names: dict[str, int]) -> set[str]:

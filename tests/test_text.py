@@ -1,6 +1,6 @@
 from botco.breakers import Breakers
 from botco.config import Breakers as BreakerConfig
-from botco.text import check_post, clean_post, mentioned, parse_verdict
+from botco.text import check_post, clean_post, mentioned
 
 
 def test_clean_post_strips_wrapping():
@@ -19,14 +19,6 @@ def test_check_post():
     assert check_post("we run 27B @ 4bpw", 280, []) == []
     assert any("hashtag" in p for p in check_post("#a #b", 280, []))
     assert any("identical" in p for p in check_post("Quantize the KV cache!", 280, ["Quantize the KV cache."]))
-
-
-def test_parse_verdict():
-    assert parse_verdict("Fine.\nVERDICT: APPROVE")[0] == "approve"
-    assert parse_verdict("Fine.\n**VERDICT: reject**")[0] == "reject"
-    assert parse_verdict("Looks good but no verdict") == ("revise", "Looks good but no verdict")
-    # The last verdict wins when the model quotes the options first.
-    assert parse_verdict("VERDICT: APPROVE or VERDICT: REVISE?\nVERDICT: REVISE")[0] == "revise"
 
 
 def test_mentioned():

@@ -1,8 +1,7 @@
-"""Durable state in SQLite. Used only from the main thread.
+"""Durable state in SQLite.
 
-The pipeline is driven by this state, not by an in-memory job list: after a
-restart, `Company.reconcile` looks at what is unfinished and queues the work
-again.
+Shared by the main thread and the agent threads, always under
+`World.lock`.
 """
 
 from __future__ import annotations
@@ -21,23 +20,30 @@ CREATE TABLE IF NOT EXISTS plans (
 );
 CREATE TABLE IF NOT EXISTS drafts (
     id INTEGER PRIMARY KEY,
-    day TEXT NOT NULL,             -- the day it was written for
-    slot INTEGER NOT NULL,
+    day TEXT NOT NULL,             -- the day it was created
+    slot INTEGER NOT NULL DEFAULT 0,  -- unused since the agents version
     text TEXT NOT NULL,
-    -- review -> (revise -> review)* -> awaiting_ceo -> approved -> published
-    -- terminal failures: rejected, dropped
-    status TEXT NOT NULL,
+    status TEXT NOT NULL,          -- draft, rejected or published
     revisions INTEGER NOT NULL DEFAULT 0,
-    feedback TEXT,
+    feedback TEXT,                 -- the editor's latest comments
     topic TEXT NOT NULL,
-    msg_id INTEGER,                -- writer's latest version in Zulip
-    review_msg_id INTEGER,         -- editor's latest review in Zulip
+    msg_id INTEGER,
+    review_msg_id INTEGER,         -- unused since the agents version
     x_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     published_at TEXT
 );
-CREATE INDEX IF NOT EXISTS drafts_day ON drafts(day, slot);
+CREATE TABLE IF NOT EXISTS draft_msgs (
+    msg_id INTEGER PRIMARY KEY,    -- any Zulip message showing a draft
+    draft_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY,
+    agent TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS metrics (
     day TEXT PRIMARY KEY,
     followers INTEGER,
@@ -51,7 +57,19 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 """
 
-TERMINAL = ("rejected", "dropped", "published")
+# Columns added by the agents version, with how to fill them from the
+# statuses of the earlier fixed pipeline.
+MIGRATION = """
+ALTER TABLE drafts ADD COLUMN author TEXT NOT NULL DEFAULT 'writer';
+ALTER TABLE drafts ADD COLUMN editor_ok INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE drafts ADD COLUMN ceo_ok INTEGER NOT NULL DEFAULT 0;
+UPDATE drafts SET editor_ok = 1 WHERE status IN ('awaiting_ceo', 'approved');
+UPDATE drafts SET ceo_ok = 1 WHERE status = 'approved';
+UPDATE drafts SET status = 'draft' WHERE status IN ('review', 'revise', 'awaiting_ceo', 'approved');
+UPDATE drafts SET status = 'rejected' WHERE status = 'dropped';
+INSERT OR IGNORE INTO draft_msgs SELECT msg_id, id FROM drafts WHERE msg_id IS NOT NULL;
+INSERT OR IGNORE INTO draft_msgs SELECT review_msg_id, id FROM drafts WHERE review_msg_id IS NOT NULL;
+"""
 
 
 @dataclass
@@ -70,14 +88,20 @@ class Draft:
     created_at: str
     updated_at: str
     published_at: str | None
+    author: str
+    editor_ok: int
+    ceo_ok: int
 
 
 class Store:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, isolation_level=None)
+        self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(drafts)")}
+        if "editor_ok" not in cols:
+            self.db.executescript(f"BEGIN; {MIGRATION} COMMIT;")
 
     @staticmethod
     def now() -> str:
@@ -112,43 +136,56 @@ class Store:
 
     # drafts
 
-    def _drafts(self, where: str, args: tuple = ()) -> list[Draft]:
-        return [Draft(**dict(r)) for r in self.db.execute(f"SELECT * FROM drafts WHERE {where} ORDER BY id", args)]
+    def _drafts(self, where: str, args: tuple = (), order: str = "id") -> list[Draft]:
+        return [Draft(**dict(r)) for r in self.db.execute(f"SELECT * FROM drafts WHERE {where} ORDER BY {order}", args)]
 
     def draft(self, draft_id: int) -> Draft | None:
         found = self._drafts("id = ?", (draft_id,))
         return found[0] if found else None
 
-    def drafts_for_day(self, day: str) -> list[Draft]:
-        return self._drafts("day = ?", (day,))
+    def open_drafts(self) -> list[Draft]:
+        return self._drafts("status = 'draft'")
 
-    def drafts_with_status(self, *statuses: str) -> list[Draft]:
-        marks = ",".join("?" * len(statuses))
-        return self._drafts(f"status IN ({marks})", statuses)
-
-    def draft_by_message(self, msg_id: int) -> Draft | None:
-        found = self._drafts("msg_id = ? OR review_msg_id = ?", (msg_id, msg_id))
-        return found[-1] if found else None
+    def ready(self, need_ceo: bool) -> list[Draft]:
+        """Drafts that may be published, oldest first."""
+        return self._drafts("status = 'draft' AND editor_ok = 1" + (" AND ceo_ok = 1" if need_ceo else ""))
 
     def published(self, limit: int = 30) -> list[Draft]:
-        rows = self.db.execute(
-            "SELECT * FROM drafts WHERE status = 'published' ORDER BY published_at DESC LIMIT ?", (limit,)
-        )
-        return [Draft(**dict(r)) for r in rows]
+        return self._drafts("status = 'published'", order=f"published_at DESC LIMIT {int(limit)}")
 
-    def add_draft(self, day: str, slot: int, text: str, topic: str, msg_id: int | None) -> int:
+    def add_draft(self, day: str, text: str, author: str) -> int:
         now = self.now()
         cur = self.db.execute(
-            "INSERT INTO drafts(day, slot, text, status, topic, msg_id, created_at, updated_at)"
-            " VALUES (?, ?, ?, 'review', ?, ?, ?, ?)",
-            (day, slot, text, topic, msg_id, now, now),
+            # slot is set because databases from the fixed pipeline have it
+            # without a default.
+            "INSERT INTO drafts(day, slot, text, status, topic, author, created_at, updated_at)"
+            " VALUES (?, 0, ?, 'draft', '', ?, ?, ?)",
+            (day, text, author, now, now),
         )
+        topic = f"draft #{cur.lastrowid}"
+        self.db.execute("UPDATE drafts SET topic = ? WHERE id = ?", (topic, cur.lastrowid))
         return cur.lastrowid
 
     def update_draft(self, draft_id: int, **fields) -> None:
         fields["updated_at"] = self.now()
         cols = ", ".join(f"{k} = ?" for k in fields)
         self.db.execute(f"UPDATE drafts SET {cols} WHERE id = ?", (*fields.values(), draft_id))
+
+    def link_message(self, msg_id: int, draft_id: int) -> None:
+        self.db.execute("INSERT OR REPLACE INTO draft_msgs(msg_id, draft_id) VALUES (?, ?)", (msg_id, draft_id))
+
+    def draft_by_message(self, msg_id: int) -> Draft | None:
+        row = self.db.execute("SELECT draft_id FROM draft_msgs WHERE msg_id = ?", (msg_id,)).fetchone()
+        return self.draft(row["draft_id"]) if row else None
+
+    # notes
+
+    def add_note(self, agent: str, text: str) -> None:
+        self.db.execute("INSERT INTO notes(agent, text, created_at) VALUES (?, ?, ?)", (agent, text, self.now()))
+
+    def notes(self, agent: str, limit: int = 30) -> list[sqlite3.Row]:
+        rows = self.db.execute("SELECT * FROM notes WHERE agent = ? ORDER BY id DESC LIMIT ?", (agent, limit))
+        return list(reversed(list(rows)))
 
     # metrics
 

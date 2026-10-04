@@ -40,10 +40,14 @@ class Team:
             self.bots[name] = Bot(name, client, me["user_id"], me["full_name"])
         self.bot_ids = {b.user_id for b in self.bots.values()}
         self._is_bot: dict[int, bool] = {}
+        # The CEO is the realm owner (role 100), or else the first human.
+        humans = [m for m in self.ops.get_members()["members"] if not m["is_bot"] and m.get("is_active", True)]
+        owners = [m for m in humans if m.get("role") == 100] or humans
+        self.ceo = owners[0]["full_name"] if owners else "CEO"
 
     @property
     def ops(self) -> zulip.Client:
-        return self.bots[self.cfg.listener].client
+        return self.bots[self.cfg.publisher].client
 
     def names(self) -> dict[str, int]:
         """Zulip full name -> user id, for mention parsing."""
@@ -54,6 +58,9 @@ class Team:
             if full_name_or_id in (b.full_name, b.user_id):
                 return b.persona
         return None
+
+    def mention(self, persona: str) -> str:
+        return f"@**{self.bots[persona].full_name}**"
 
     def is_bot(self, user_id: int) -> bool:
         """Any bot account counts, not only ours."""
@@ -94,15 +101,19 @@ class Team:
     def notify(self, text: str, topic: str = "alerts") -> None:
         """Operational message to #ops. Never blocked: alerts must get through."""
         try:
-            self.send(self.cfg.listener, self.cfg.streams.ops, topic, text, check=False)
+            self.send(self.cfg.publisher, self.cfg.streams.ops, topic, text, check=False)
         except Exception:
             log.exception("cannot post to #ops: %s", text)
 
     def react(self, persona: str, msg_id: int, emoji: str) -> None:
         self.bots[persona].client.add_reaction({"message_id": msg_id, "emoji_name": emoji})
 
-    def history(self, stream: str, topic: str | None = None, n: int = 30) -> list[dict]:
-        narrow = [{"operator": "channel", "operand": stream}]
+    def history(self, stream: str | None = None, topic: str | None = None, n: int = 30) -> list[dict]:
+        """Latest messages, oldest first: one topic, one stream, or every
+        stream the publisher is subscribed to."""
+        narrow = []
+        if stream is not None:
+            narrow.append({"operator": "channel", "operand": stream})
         if topic is not None:
             narrow.append({"operator": "topic", "operand": topic})
         r = self.ops.get_messages(
@@ -111,12 +122,12 @@ class Team:
         return r.get("messages", [])
 
     def listen(self, inbox: queue.Queue) -> None:
-        """Push every message and reaction event into `inbox`, from a thread.
-        The zulip library re-registers the queue after errors by itself."""
+        """Push every message and reaction event into `inbox`, from a thread,
+        on a client of its own. The zulip library re-registers the queue
+        after errors by itself."""
+        client = zulip.Client(config_file=str(self.cfg.personas[self.cfg.publisher].zuliprc), client="botco-events")
 
         def run() -> None:
-            self.ops.call_on_each_event(
-                inbox.put, event_types=["message", "reaction"], apply_markdown=False, all_public_streams=False
-            )
+            client.call_on_each_event(inbox.put, event_types=["message", "reaction"], apply_markdown=False)
 
         threading.Thread(target=run, name="zulip-events", daemon=True).start()
