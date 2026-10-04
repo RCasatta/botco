@@ -15,6 +15,7 @@ turn, and runs the parts that stay deterministic on purpose:
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 from collections import defaultdict
@@ -60,6 +61,7 @@ class Company:
         order = [self.cfg.agents.coordinator] + [a for a in AGENTS if a != self.cfg.agents.coordinator]
         self.last_turn = {a: now - beat + i * beat / len(order) for i, a in enumerate(order)}
         self.notified: set[str] = set()
+        self.lab_checked = datetime.min.replace(tzinfo=self.w.tz)
 
     # main loop
 
@@ -122,6 +124,9 @@ class Company:
                     self.pending[agent].append(Trigger("heartbeat"))
         self.publish()
         self.record_metrics()
+        if now - self.lab_checked >= timedelta(minutes=10):
+            self.lab_checked = now
+            self.watch_lab()
 
     def schedule(self) -> None:
         """Start turns for agents with a reason to wake, as workers free up.
@@ -223,6 +228,25 @@ class Company:
             f"ready to publish: {', '.join(f'#{d.id}' for d in ready) or 'none'}",
             f"**Published today**: {w.published_on(w.today())}",
         ])
+
+    def watch_lab(self) -> None:
+        """Wake the coordinator when reports in the lab notebook appear or
+        change: new results are the best material the team has."""
+        lab = self.w.lab
+        if not lab or not lab.available():
+            return
+        current = {n.path: n.modified.isoformat() for n in lab.notes()}
+        seen = self.w.store.get("lab_seen")
+        self.w.store.put("lab_seen", json.dumps(current))
+        if seen is None:
+            what = f"the team can now read it ({len(current)} reports)"
+        else:
+            old = json.loads(seen)
+            changed = [p for p, m in current.items() if old.get(p) != m]
+            if not changed:
+                return
+            what = "new or updated: " + ", ".join(f"`{p}`" for p in changed[:10])
+        self.pending[self.cfg.agents.coordinator].append(Trigger("lab", content=what))
 
     # publishing and metrics: no model involved
 

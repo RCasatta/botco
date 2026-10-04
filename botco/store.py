@@ -91,6 +91,7 @@ class Draft:
     author: str
     editor_ok: int
     ceo_ok: int
+    note: str | None = None  # the author's note: sources, intent
 
 
 class Store:
@@ -102,6 +103,8 @@ class Store:
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(drafts)")}
         if "editor_ok" not in cols:
             self.db.executescript(f"BEGIN; {MIGRATION} COMMIT;")
+        if "note" not in cols:
+            self.db.execute("ALTER TABLE drafts ADD COLUMN note TEXT")
 
     @staticmethod
     def now() -> str:
@@ -153,14 +156,14 @@ class Store:
     def published(self, limit: int = 30) -> list[Draft]:
         return self._drafts("status = 'published'", order=f"published_at DESC LIMIT {int(limit)}")
 
-    def add_draft(self, day: str, text: str, author: str) -> int:
+    def add_draft(self, day: str, text: str, author: str, note: str = "") -> int:
         now = self.now()
         cur = self.db.execute(
             # slot is set because databases from the fixed pipeline have it
             # without a default.
-            "INSERT INTO drafts(day, slot, text, status, topic, author, created_at, updated_at)"
-            " VALUES (?, 0, ?, 'draft', '', ?, ?, ?)",
-            (day, text, author, now, now),
+            "INSERT INTO drafts(day, slot, text, status, topic, author, note, created_at, updated_at)"
+            " VALUES (?, 0, ?, 'draft', '', ?, ?, ?, ?)",
+            (day, text, author, note, now, now),
         )
         topic = f"draft #{cur.lastrowid}"
         self.db.execute("UPDATE drafts SET topic = ? WHERE id = ?", (topic, cur.lastrowid))

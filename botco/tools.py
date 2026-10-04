@@ -55,6 +55,7 @@ class Tool:
     run: Callable[[World, Turn, dict], str]
     agents: tuple[str, ...] = ()  # empty: everyone
     human_turn_only: bool = False
+    needs_lab: bool = False
     required: list[str] = field(default_factory=list)
 
     def spec(self) -> dict:
@@ -102,9 +103,9 @@ def create_draft(w: World, turn: Turn, a: dict) -> str:
     problems = w.check(post)
     if problems:
         raise ToolError("not saved, the post breaks the rules: " + "; ".join(problems))
-    draft_id = w.store.add_draft(w.today(), post, turn.agent)
-    d = w.store.draft(draft_id)
     note = fix_mentions(w, a.get("note", "").strip())
+    draft_id = w.store.add_draft(w.today(), post, turn.agent, note)
+    d = w.store.draft(draft_id)
     msg = f"New draft **#{d.id}** by {turn.agent}, {T.x_length(post)} characters:\n{quote(post)}"
     w.post_about(turn.agent, d, msg + (f"\n{note}" if note else ""), check=False)
     turn.spoke = True
@@ -120,8 +121,8 @@ def revise_draft(w: World, turn: Turn, a: dict) -> str:
     if problems:
         raise ToolError("not saved, the post breaks the rules: " + "; ".join(problems))
     n = d.revisions + 1
-    w.store.update_draft(d.id, text=post, revisions=n, editor_ok=0, ceo_ok=0)
     note = fix_mentions(w, a.get("note", "").strip())
+    w.store.update_draft(d.id, text=post, revisions=n, editor_ok=0, ceo_ok=0, note=note or d.note)
     msg = f"Revision {n} of **#{d.id}** by {turn.agent}, {T.x_length(post)} characters:\n{quote(post)}"
     w.post_about(turn.agent, d, msg + (f"\n{note}" if note else ""), check=False)
     turn.spoke = True
@@ -186,6 +187,17 @@ def read_topic(w: World, turn: Turn, a: dict) -> str:
     return "\n".join(f"{m['sender_full_name']}: {m['content'][:1500]}" for m in msgs)
 
 
+def read_lab_note(w: World, turn: Turn, a: dict) -> str:
+    try:
+        return w.lab.read(a["path"], a.get("section", ""), int(a.get("part", 1)))
+    except FileNotFoundError as e:
+        raise ToolError(str(e))
+
+
+def search_lab_notes(w: World, turn: Turn, a: dict) -> str:
+    return w.lab.search(a["query"])
+
+
 def remember(w: World, turn: Turn, a: dict) -> str:
     note = a["note"].strip()
     if not note:
@@ -225,6 +237,13 @@ TOOLS = [
     Tool("read_topic",
          "Read the latest 30 messages of a Zulip topic.",
          {"stream": S, "topic": S}, read_topic, required=["stream", "topic"]),
+    Tool("read_lab_note",
+         "Read a report from the lab notebook (our own inference experiments). Long reports come in parts; "
+         "pass a section name to read just that section.",
+         {"path": S, "section": S, "part": I}, read_lab_note, needs_lab=True, required=["path"]),
+    Tool("search_lab_notes",
+         "Find lines in the lab notebook that contain all the given words, e.g. 'decode 160K' or 'rejected SGLang'.",
+         {"query": S}, search_lab_notes, needs_lab=True, required=["query"]),
     Tool("remember",
          "Write a short note to yourself: a lesson, a commitment, something to follow up. "
          "You see your notes at the start of every turn.",
@@ -233,14 +252,15 @@ TOOLS = [
 BY_NAME = {t.name: t for t in TOOLS}
 
 
-def available(agent: str, turn: Turn) -> list[Tool]:
-    return [t for t in TOOLS if (not t.agents or agent in t.agents) and (turn.human or not t.human_turn_only)]
+def available(agent: str, turn: Turn, lab: bool = False) -> list[Tool]:
+    return [t for t in TOOLS if (not t.agents or agent in t.agents) and (turn.human or not t.human_turn_only)
+            and (lab or not t.needs_lab)]
 
 
 def execute(w: World, turn: Turn, name: str, arguments: str) -> str:
     """Run one tool call and return what the model sees as its result."""
     tool = BY_NAME.get(name)
-    if tool is None or tool not in available(turn.agent, turn):
+    if tool is None or tool not in available(turn.agent, turn, w.lab is not None):
         result = f"error: you cannot use {name} now"
     else:
         try:

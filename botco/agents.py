@@ -55,6 +55,9 @@ def system_prompt(w: World, agent: str) -> str:
 def describe_trigger(t: Trigger) -> str:
     if t.kind == "heartbeat":
         return "- Routine check-in: nobody called you. Look at the situation and do what your role needs, if anything."
+    if t.kind == "lab":
+        return (f"- The lab notebook changed: {t.content}. New results can be material for posts; "
+                "read what changed and decide whether the plan or the writer should use it.")
     who = "the CEO" if t.kind == "human" else t.sender
     return f"- {who} wrote in #{t.stream} > {t.topic}:\n{quote(t.content[:2000])}"
 
@@ -85,6 +88,8 @@ def situation(w: World, turn: Turn) -> str:
         if need_ceo:
             state += f", CEO: {'approved' if d.ceo_ok else 'not approved'}"
         lines.append(f"### #{d.id} by {d.author}, version {d.revisions + 1} ({state})\n{quote(d.text)}")
+        if d.note:
+            lines.append(f"Author's note: {d.note}")
         if d.feedback:
             lines.append(f"Editor's latest comments: {d.feedback}")
     parts.append("## Open drafts\n" + ("\n".join(lines) if lines else "None."))
@@ -108,6 +113,11 @@ def situation(w: World, turn: Turn) -> str:
     notes = store.notes(turn.agent)
     if notes:
         parts.append("## Your notes\n" + "\n".join(f"- [{n['created_at'][:10]}] {n['text']}" for n in notes))
+
+    if w.lab and w.lab.available():
+        notes = w.lab.notes()
+        parts.append("## Lab notebook (our own experiments on this machine; read with read_lab_note)\n" + "\n".join(
+            f"- `{n.path}` ({n.modified:%Y-%m-%d}, {n.size // 1000} KB): {n.title}" for n in notes))
 
     if turn.agent == "strategist" and cfg.reference_file and cfg.reference_file.exists():
         parts.append("## Posts by accounts the CEO likes (for tone and topics; never copy)\n"
@@ -179,7 +189,7 @@ class Runner:
                 {"role": "system", "content": system_prompt(w, turn.agent)},
                 {"role": "user", "content": situation(w, turn)},
             ]
-            specs = [t.spec() for t in tools.available(turn.agent, turn)]
+            specs = [t.spec() for t in tools.available(turn.agent, turn, w.lab is not None)]
         steps, reply = 0, None
         while steps < w.cfg.agents.max_steps:
             if w.halted.is_set():

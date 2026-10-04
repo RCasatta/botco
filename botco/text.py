@@ -8,6 +8,8 @@ from difflib import SequenceMatcher
 URL_RE = re.compile(r"https?://|www\.|\b[a-z0-9-]+\.(com|ai|io|org|net|dev|co|it)\b", re.IGNORECASE)
 MENTION_RE = re.compile(r"(?<![\w@])@\w{1,15}")
 HASHTAG_RE = re.compile(r"(?<!\w)#\w+")
+# Internal details from the lab notebook that must not reach a public post.
+ADDRESS_RE = re.compile(r"\b\d{1,3}(\.\d{1,3}){3}\b|localhost|(?<![\w.])(~|/home|/var|/etc|/run|/nix|/tmp)/\S")
 # Zulip markdown mentions: @**Name** or @**Name|id**; @_**...** is silent.
 ZULIP_MENTION_RE = re.compile(r"(?<!_)@\*\*([^*|]+)(?:\|(\d+))?\*\*")
 
@@ -46,6 +48,8 @@ def check_post(text: str, max_chars: int, previous: list[str]) -> list[str]:
         problems.append("contains a link or domain; posts must not contain links")
     if MENTION_RE.search(text):
         problems.append("mentions an account; posts must not @-mention anyone")
+    if ADDRESS_RE.search(text):
+        problems.append("contains an IP address, host or file path; keep internal details out of posts")
     if len(HASHTAG_RE.findall(text)) > 1:
         problems.append("more than one hashtag")
     for old in previous:

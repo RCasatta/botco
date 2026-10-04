@@ -36,6 +36,12 @@ metrics_time = "23:30"
 bot_messages_per_hour = 40
 bot_streak_per_topic = 20
 
+# The lab notebook: markdown reports of the inference experiments, read by
+# the agents through tools. On ripper the service sees it at /run/botco-lab.
+[lab]
+dir = "/run/botco-lab"
+exclude = ["CLAUDE.md", "models", "llama.cpp", "Strata", "src", ".git"]
+
 [x]
 dry_run = true
 env_file = "x.env"

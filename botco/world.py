@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from . import text as T
 from .config import Config
+from .lab import Lab
 from .store import Draft, Store
 from .team import Team
 
@@ -23,6 +24,7 @@ class World:
         self.store = store
         self.team = team
         self.x = x
+        self.lab = Lab(cfg.lab.dir, cfg.lab.exclude) if cfg.lab.dir else None
         self.tz = ZoneInfo(cfg.timezone)
         # Held for every store or Zulip access; never while waiting for the
         # model.

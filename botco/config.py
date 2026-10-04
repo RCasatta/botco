@@ -81,6 +81,15 @@ class Breakers:
 
 
 @dataclass
+class LabConfig:
+    # The lab notebook: markdown reports of the experiments. None: no notebook.
+    dir: Path | None = None
+    # File or directory names to leave out: vendored repos, models, notes
+    # meant for other tools.
+    exclude: list[str] = field(default_factory=lambda: ["CLAUDE.md", "models", "llama.cpp", "Strata", "src", ".git"])
+
+
+@dataclass
 class XConfig:
     dry_run: bool = True
     env_file: Path = Path("x.env")
@@ -97,6 +106,7 @@ class Config:
     breakers: Breakers
     x: XConfig
     personas: dict[str, Persona]
+    lab: LabConfig = field(default_factory=LabConfig)
     # Optional file with example posts the team should learn tone and topics
     # from (never copy).
     reference_file: Path | None = None
@@ -139,6 +149,9 @@ def load(path: Path) -> Config:
     for required in (*AGENTS, "publisher"):
         if required not in personas:
             raise ValueError(f"config: missing [personas.{required}]")
+    lab = dict(raw.get("lab", {}))
+    if lab.get("dir"):
+        lab["dir"] = rel(lab["dir"])
     ref = raw.get("reference_file")
     return Config(
         state_dir=rel(raw.get("state_dir", "state")),
@@ -150,5 +163,6 @@ def load(path: Path) -> Config:
         breakers=Breakers(**raw.get("breakers", {})),
         x=XConfig(dry_run=x.get("dry_run", True), env_file=rel(x.get("env_file", "x.env"))),
         personas=personas,
+        lab=LabConfig(**lab),
         reference_file=rel(ref) if ref else None,
     )

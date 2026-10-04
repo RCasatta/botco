@@ -9,12 +9,18 @@
 #   };
 #
 # Secrets (zuliprc files, x.env) should be owned by the botco user.
+#
+# `labDir` makes a lab notebook (markdown experiment reports) readable by the
+# agents: it is bind-mounted read-only at /run/botco-lab inside the service,
+# so the service user needs no access to the directories around it.
 self:
 { config, lib, pkgs, ... }:
 
 let
   cfg = config.services.botco;
-  configFile = (pkgs.formats.toml { }).generate "botco.toml" ({ state_dir = "/var/lib/botco"; } // cfg.settings);
+  labMount = "/run/botco-lab";
+  defaults = { state_dir = "/var/lib/botco"; } // lib.optionalAttrs (cfg.labDir != null) { lab.dir = labMount; };
+  configFile = (pkgs.formats.toml { }).generate "botco.toml" (lib.recursiveUpdate defaults cfg.settings);
 in
 {
   options.services.botco = {
@@ -22,6 +28,12 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+    };
+    labDir = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/home/alice/inference";
+      description = "Directory with the lab notebook, shown read-only to the service.";
     };
     settings = lib.mkOption {
       type = (pkgs.formats.toml { }).type;
@@ -56,6 +68,7 @@ in
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
+        BindReadOnlyPaths = lib.optional (cfg.labDir != null) "${cfg.labDir}:${labMount}";
       };
     };
   };

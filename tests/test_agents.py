@@ -268,6 +268,26 @@ def test_situation_shows_drafts_and_approvals(env):
     assert "no plan for 2026-W41" in text
 
 
+def test_lab_changes_wake_the_coordinator(env, tmp_path):
+    world, llm, runner, company = env
+    from botco.lab import Lab
+    notebook = tmp_path / "lab"
+    notebook.mkdir()
+    (notebook / "A.md").write_text("# A\n")
+    world.lab = Lab(notebook, [])
+    company.watch_lab()
+    (t,) = company.pending["strategist"]
+    assert t.kind == "lab" and "1 reports" in t.content
+    company.pending["strategist"] = []
+    company.watch_lab()
+    assert not company.pending["strategist"]  # nothing changed
+    (notebook / "B.md").write_text("# B\n")
+    company.watch_lab()
+    assert "`B.md`" in company.pending["strategist"][0].content
+    text = situation(world, Turn("writer", [Trigger("heartbeat")]))
+    assert "## Lab notebook" in text and "`B.md`" in text
+
+
 def test_migrates_the_fixed_pipeline_database(tmp_path):
     db = sqlite3.connect(tmp_path / "old.sqlite3")
     db.executescript("""
