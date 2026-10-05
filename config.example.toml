@@ -51,10 +51,12 @@ zuliprc = "strategist-zuliprc"
 thinking = true
 max_tokens = 16000
 
+# Every agent uses the same thinking setting: the chat template starts the
+# prompt with it, so a different one would cost the shared cache prefix.
 [personas.writer]
 zuliprc = "writer-zuliprc"
-thinking = false
-max_tokens = 4096
+thinking = true
+max_tokens = 8000
 temperature = 0.9
 
 [personas.editor]

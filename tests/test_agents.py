@@ -9,13 +9,13 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from botco.agents import Runner, TurnDone, situation
+from botco.agents import Runner, TurnDone, situation, system_prompt
 from botco.breakers import Breakers
 from botco.company import Company
 from botco.config import AGENTS, Agents, Breakers as BreakerConfig, Config, LLMConfig, Persona, Publishing
 from botco.config import Streams, XConfig
 from botco.store import Store
-from botco.tools import Trigger, Turn, available, fix_mentions
+from botco.tools import Trigger, Turn, available, fix_mentions, offered
 from botco.world import World
 from botco.xclient import DryRunX
 
@@ -183,7 +183,7 @@ def test_tools_enforce_the_rules(env):
     runner.run_turn(turn)
     results = [m["content"] for m in llm.seen["writer"][-1] if m["role"] == "tool"]
     assert "link" in results[0] and "not saved" in results[0]
-    assert "cannot use review_draft" in results[1]
+    assert "review_draft is for the editor" in results[1]
     assert world.store.open_drafts() == []
     world.store.add_draft("2026-10-05", "Same text", "writer")
     llm.script["writer"] = [[call("revise_draft", draft_id=1, text="Same text")], "ok"]
@@ -286,6 +286,26 @@ def test_lab_changes_wake_the_coordinator(env, tmp_path):
     assert "`B.md`" in company.pending["strategist"][0].content
     text = situation(world, Turn("writer", [Trigger("heartbeat")]))
     assert "## Lab notebook" in text and "`B.md`" in text
+
+
+def test_requests_share_their_beginning_across_agents_and_turns(env):
+    """The server reuses its cache up to the first difference, and the chat
+    template puts the tools first: system prompt and tools must not depend on
+    the agent or on why it woke, and the situation must put the agent's role
+    after the shared sections and the clock last."""
+    world, *_ = env
+    world.store.add_plan("2026-W41", "Plan text")
+    world.store.add_draft("2026-10-05", "A post", "writer")
+    turns = [Turn("strategist", [Trigger("human")]), Turn("writer", [Trigger("heartbeat")]),
+             Turn("editor", [Trigger("bot", "writer")])]
+    assert len({system_prompt(world) for _ in turns}) == 1
+    assert {t.name for t in offered(False)} == {t.name for t in available("strategist", turns[0], False)} | \
+        {t.name for t in available("editor", turns[2], False)}
+    texts = [situation(world, t) for t in turns]
+    shared = texts[0][:texts[0].index("## Your role")]
+    assert "Plan text" in shared and "## Publishing" in shared
+    assert all(t.startswith(shared) for t in texts)
+    assert all(t.rindex("It is Monday") > t.index("## Open drafts") > t.index("## Your role") for t in texts)
 
 
 def test_migrates_the_fixed_pipeline_database(tmp_path):

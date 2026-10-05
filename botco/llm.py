@@ -42,7 +42,10 @@ class LLM:
 
     def chat(self, persona: Persona, messages: list[dict], tools: list[dict] | None = None) -> dict:
         """One completion. Returns the assistant message: `content` without
-        the thinking, and `tool_calls` if the model called tools."""
+        the thinking, `tool_calls` if the model called tools, and the thinking
+        as `reasoning_content`. Sent back within a turn, the reasoning keeps
+        the model's earlier thoughts and lets the server reuse its cache: the
+        chat template replays it in a <think> block, as it was generated."""
         body = {
             "messages": messages,
             "max_tokens": persona.max_tokens,
@@ -67,5 +70,6 @@ class LLM:
         return {
             "role": "assistant",
             "content": THINK_RE.sub("", msg.get("content") or "").strip(),
+            "reasoning_content": msg.get("reasoning_content") or "",
             "tool_calls": msg.get("tool_calls") or [],
         }

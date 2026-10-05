@@ -44,12 +44,14 @@ def prompt(name: str) -> str:
     return resources.files("botco").joinpath(f"prompts/{name}.md").read_text()
 
 
-def system_prompt(w: World, agent: str) -> str:
+def system_prompt(w: World) -> str:
+    """The same for every agent: the role comes later, in the situation, so
+    the server can reuse its cache for this part across agents."""
     team = prompt("team").format(
         drafts=w.cfg.streams.drafts, plan=w.cfg.streams.plan, ops=w.cfg.streams.ops,
         published=w.cfg.streams.published, coordinator=w.cfg.agents.coordinator, ceo=w.team.ceo,
     )
-    return f"{prompt('common')}\n\n{team}\n\n{prompt(agent)}"
+    return f"{prompt('common')}\n\n{team}"
 
 
 def describe_trigger(t: Trigger) -> str:
@@ -62,15 +64,35 @@ def describe_trigger(t: Trigger) -> str:
     return f"- {who} wrote in #{t.stream} > {t.topic}:\n{quote(t.content[:2000])}"
 
 
-def situation(w: World, turn: Turn) -> str:
-    """Everything the agent knows at the start of its turn."""
-    cfg, store, now = w.cfg, w.store, w.now()
-    parts = [f"It is {now:%A %Y-%m-%d %H:%M} ({cfg.timezone}). You are the {turn.agent}."]
+def chat_window(w: World) -> list[dict]:
+    """Today's messages, so the section only grows during the day and its
+    beginning stays reusable; at least the latest 20, at most 80."""
+    cfg = w.cfg
+    msgs = [m for m in w.team.history(n=150)
+            if isinstance(m.get("display_recipient"), str)
+            and not (m["display_recipient"] == cfg.streams.ops and m.get("subject") == "activity")]
+    midnight = w.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    today = [m for m in msgs if m["timestamp"] >= midnight]
+    return (today if len(today) >= 20 else msgs[-20:])[-80:]
 
-    parts.append("## Why you are awake\n" + "\n".join(describe_trigger(t) for t in turn.triggers))
-    if turn.human:
-        parts[-1] += ("\nA human wrote to you: answer them in the same topic with send_message. "
-                      "If they stated a decision about a draft, record it with ceo_decision.")
+
+def situation(w: World, turn: Turn) -> str:
+    """Everything the agent knows at the start of its turn.
+
+    Ordered from what changes least to what changes most, because the server
+    reuses its cache only up to the first difference from an earlier
+    request: first what every agent shares and rarely changes (lab index,
+    plan, published posts), then this agent's role and notes, then what moves
+    during the day (chat, drafts, queue), and the reason for the turn and the
+    time last."""
+    cfg, store, now = w.cfg, w.store, w.now()
+    need_ceo = cfg.publishing.ceo_approval
+    parts = []
+
+    # Shared by every agent, changes rarely.
+    if w.lab and w.lab.available():
+        parts.append("## Lab notebook (our own experiments on this machine; read with read_lab_note)\n" + "\n".join(
+            f"- `{n.path}` ({n.modified:%Y-%m-%d}, {n.size // 1000} KB): {n.title}" for n in w.lab.notes()))
 
     plan = store.latest_plan(w.week())
     if plan:
@@ -80,26 +102,9 @@ def situation(w: World, turn: Turn) -> str:
         parts.append(f"## Content plan\nThere is no plan for {w.week()} yet."
                      + (f" Last week's plan ({last['week']}):\n{last['text']}" if last else ""))
 
-    drafts = store.open_drafts()
-    need_ceo = cfg.publishing.ceo_approval
-    lines = []
-    for d in drafts:
-        state = f"editor: {'approved' if d.editor_ok else 'not approved'}"
-        if need_ceo:
-            state += f", CEO: {'approved' if d.ceo_ok else 'not approved'}"
-        lines.append(f"### #{d.id} by {d.author}, version {d.revisions + 1} ({state})\n{quote(d.text)}")
-        if d.note:
-            lines.append(f"Author's note: {d.note}")
-        if d.feedback:
-            lines.append(f"Editor's latest comments: {d.feedback}")
-    parts.append("## Open drafts\n" + ("\n".join(lines) if lines else "None."))
-
     times = ", ".join(t.strftime("%H:%M") for t in cfg.publishing.times)
-    ready = store.ready(need_ceo)
     gate = "the editor and the CEO" if need_ceo else "the editor"
-    pub = [f"The publisher (a script) posts to X at {times}: each time, the oldest draft approved by {gate}. "
-           f"Published today: {w.published_on(w.today())}. "
-           f"Ready to publish: {', '.join(f'#{d.id}' for d in ready) or 'none'}."]
+    pub = [f"The publisher (a script) posts to X at {times}: each time, the oldest draft approved by {gate}."]
     recent = store.published(10)
     if recent:
         pub.append("Recently published, newest first:\n" +
@@ -110,28 +115,47 @@ def situation(w: World, turn: Turn) -> str:
     if metrics:
         parts.append("## Followers\n" + "\n".join(f"- {m['day']}: {m['followers']}" for m in metrics))
 
+    # This agent.
+    parts.append(f"## Your role\n{prompt(turn.agent)}")
     notes = store.notes(turn.agent)
     if notes:
         parts.append("## Your notes\n" + "\n".join(f"- [{n['created_at'][:10]}] {n['text']}" for n in notes))
-
-    if w.lab and w.lab.available():
-        notes = w.lab.notes()
-        parts.append("## Lab notebook (our own experiments on this machine; read with read_lab_note)\n" + "\n".join(
-            f"- `{n.path}` ({n.modified:%Y-%m-%d}, {n.size // 1000} KB): {n.title}" for n in notes))
-
     if turn.agent == "strategist" and cfg.reference_file and cfg.reference_file.exists():
         parts.append("## Posts by accounts the CEO likes (for tone and topics; never copy)\n"
                      + cfg.reference_file.read_text()[:6000])
 
-    msgs = [m for m in w.team.history(n=50)
-            if not (m.get("display_recipient") == cfg.streams.ops and m.get("subject") == "activity")][-35:]
+    # Moves during the day.
+    msgs = chat_window(w)
     if msgs:
-        parts.append("## Latest messages in the team chat, oldest first\n" + "\n".join(
+        parts.append("## Team chat, oldest first\n" + "\n".join(
             f"[{time.strftime('%a %H:%M', time.localtime(m['timestamp']))}] "
             f"#{m['display_recipient']} > {m['subject']} | {m['sender_full_name']}: {m['content'][:600]}"
-            for m in msgs if isinstance(m.get("display_recipient"), str)))
+            for m in msgs))
 
-    parts.append("Now act. Use tools; when you have nothing more to do, reply with a one-line summary.")
+    lines = []
+    for d in store.open_drafts():
+        state = f"editor: {'approved' if d.editor_ok else 'not approved'}"
+        if need_ceo:
+            state += f", CEO: {'approved' if d.ceo_ok else 'not approved'}"
+        lines.append(f"### #{d.id} by {d.author}, version {d.revisions + 1} ({state})\n{quote(d.text)}")
+        if d.note:
+            lines.append(f"Author's note: {d.note}")
+        if d.feedback:
+            lines.append(f"Editor's latest comments: {d.feedback}")
+    parts.append("## Open drafts\n" + ("\n".join(lines) if lines else "None."))
+
+    ready = store.ready(need_ceo)
+    parts.append(f"## Publishing queue\nPublished today: {w.published_on(w.today())}. "
+                 f"Ready to publish: {', '.join(f'#{d.id}' for d in ready) or 'none'}.")
+
+    # This turn.
+    awake = "## Why you are awake\n" + "\n".join(describe_trigger(t) for t in turn.triggers)
+    if turn.human:
+        awake += ("\nA human wrote to you: answer them in the same topic with send_message. "
+                  "If they stated a decision about a draft, record it with ceo_decision.")
+    parts.append(awake)
+    parts.append(f"It is {now:%A %Y-%m-%d %H:%M} ({cfg.timezone}). You are the {turn.agent}. "
+                 "Now act. Use tools; when you have nothing more to do, reply with a one-line summary.")
     return "\n\n".join(parts)
 
 
@@ -186,10 +210,10 @@ class Runner:
         w, persona = self.w, self.w.cfg.personas[turn.agent]
         with w.lock:
             messages = [
-                {"role": "system", "content": system_prompt(w, turn.agent)},
+                {"role": "system", "content": system_prompt(w)},
                 {"role": "user", "content": situation(w, turn)},
             ]
-            specs = [t.spec() for t in tools.available(turn.agent, turn, w.lab is not None)]
+            specs = [t.spec() for t in tools.offered(w.lab is not None)]
         steps, reply = 0, None
         while steps < w.cfg.agents.max_steps:
             if w.halted.is_set():

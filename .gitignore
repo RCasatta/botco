@@ -8,3 +8,5 @@ state/
 result
 __pycache__/
 .direnv/
+# Rendered prompts with live chat and drafts
+samples/

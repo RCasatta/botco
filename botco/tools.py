@@ -214,25 +214,27 @@ TOOLS = [
          "Post a message in a Zulip stream and topic. Mention a teammate as @**name** to wake them up.",
          {"stream": S, "topic": S, "content": S}, send_message, required=["stream", "topic", "content"]),
     Tool("create_draft",
-         "Save a new X post draft and show it in #drafts. The text must be the exact post. "
+         "Writer and strategist. Save a new X post draft and show it in #drafts. The text must be the exact post. "
          "Use the note to tell the team something about it, e.g. ask @**editor** for a review.",
          {"text": S, "note": S}, create_draft, agents=("writer", "strategist"), required=["text"]),
     Tool("revise_draft",
-         "Replace the text of an open draft with a new version. The editor must review it again.",
+         "Writer and strategist. Replace the text of an open draft with a new version. "
+         "The editor must review it again.",
          {"draft_id": I, "text": S, "note": S}, revise_draft, agents=("writer", "strategist"),
          required=["draft_id", "text"]),
     Tool("review_draft",
-         "Give your verdict on an open draft: approve (publishable as is), revise (fixable, say how in "
-         "comments) or reject (not worth fixing).",
+         "Editor only. Give your verdict on an open draft: approve (publishable as is), revise (fixable, "
+         "say how in comments) or reject (not worth fixing).",
          {"draft_id": I, "verdict": {"type": "string", "enum": ["approve", "revise", "reject"]}, "comments": S},
          review_draft, agents=("editor",), required=["draft_id", "verdict", "comments"]),
     Tool("ceo_decision",
-         "Record a decision the CEO clearly stated about a draft in the message you are answering, "
-         "e.g. 'post 5 is good' or 'drop 6'. Never use it on your own judgment. Quote the CEO's words.",
+         "Only in a turn started by the CEO's message. Record a decision the CEO clearly stated about a draft "
+         "in that message, e.g. 'post 5 is good' or 'drop 6'. Never use it on your own judgment. "
+         "Quote the CEO's words.",
          {"draft_id": I, "decision": {"type": "string", "enum": ["approve", "reject"]}, "ceo_words": S},
          ceo_decision, human_turn_only=True, required=["draft_id", "decision", "ceo_words"]),
     Tool("update_plan",
-         "Replace this week's content plan with a new version and post it in #plan.",
+         "Strategist only. Replace this week's content plan with a new version and post it in #plan.",
          {"text": S}, update_plan, agents=("strategist",), required=["text"]),
     Tool("read_topic",
          "Read the latest 30 messages of a Zulip topic.",
@@ -252,16 +254,34 @@ TOOLS = [
 BY_NAME = {t.name: t for t in TOOLS}
 
 
+def offered(lab: bool) -> list[Tool]:
+    """The tools in every request, the same for every agent and turn: the
+    chat template puts them before everything else, so one fixed list keeps
+    the prompt's beginning identical and lets the server reuse its cache.
+    Who may use what is checked when a tool runs."""
+    return [t for t in TOOLS if lab or not t.needs_lab]
+
+
+def refusal(tool: Tool, turn: Turn) -> str | None:
+    if tool.agents and turn.agent not in tool.agents:
+        return f"{tool.name} is for the {' and '.join(tool.agents)}; ask them by mentioning them"
+    if tool.human_turn_only and not turn.human:
+        return f"{tool.name} only works in a turn started by the CEO's message"
+    return None
+
+
 def available(agent: str, turn: Turn, lab: bool = False) -> list[Tool]:
-    return [t for t in TOOLS if (not t.agents or agent in t.agents) and (turn.human or not t.human_turn_only)
-            and (lab or not t.needs_lab)]
+    """The tools this agent may actually use in this turn."""
+    return [t for t in offered(lab) if refusal(t, Turn(agent, turn.triggers)) is None]
 
 
 def execute(w: World, turn: Turn, name: str, arguments: str) -> str:
     """Run one tool call and return what the model sees as its result."""
     tool = BY_NAME.get(name)
-    if tool is None or tool not in available(turn.agent, turn, w.lab is not None):
-        result = f"error: you cannot use {name} now"
+    if tool is None or tool not in offered(w.lab is not None):
+        result = f"error: there is no tool {name}"
+    elif why := refusal(tool, turn):
+        result = f"error: {why}"
     else:
         try:
             args = json.loads(arguments or "{}")
