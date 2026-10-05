@@ -24,6 +24,8 @@ active_to = "23:00"
 max_steps = 10
 max_turns_per_day = 300
 activity_log = true
+continue_minutes = 15
+continue_max_chars = 200000
 
 [publishing]
 times = ["10:00", "14:00", "19:00"]

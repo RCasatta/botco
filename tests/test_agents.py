@@ -3,14 +3,14 @@
 import json
 import queue
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 import requests
 
-from botco.agents import Runner, TurnDone, fingerprint_key, situation, system_prompt
+from botco.agents import Runner, TurnDone, clock_line, fingerprint_key, situation, system_prompt
 from botco.breakers import Breakers
 from botco.company import Company
 from botco.config import AGENTS, Agents, Breakers as BreakerConfig, Config, LLMConfig, Persona, Publishing
@@ -91,9 +91,10 @@ class ScriptedLLM:
     def chat(self, persona, messages, tools=None):
         self.seen[persona.name].append(messages)
         step = self.script[persona.name].pop(0)
+        thought = f"thinking before step {len(self.seen[persona.name])}"
         if isinstance(step, str):
-            return {"role": "assistant", "content": step, "tool_calls": []}
-        return {"role": "assistant", "content": "", "tool_calls": step}
+            return {"role": "assistant", "content": step, "reasoning_content": thought, "tool_calls": []}
+        return {"role": "assistant", "content": "", "reasoning_content": thought, "tool_calls": step}
 
 
 class Clock(World):
@@ -189,7 +190,7 @@ def test_tools_enforce_the_rules(env):
     world.store.add_draft("2026-10-05", "Same text", "writer")
     llm.script["writer"] = [[call("revise_draft", draft_id=1, text="Same text")], "ok"]
     runner.run_turn(Turn("writer", [Trigger("heartbeat")]))
-    assert "identical" in [m for m in llm.seen["writer"][-1] if m["role"] == "tool"][0]["content"]
+    assert "identical" in [m for m in llm.seen["writer"][-1] if m["role"] == "tool"][-1]["content"]
     # The CEO's decision can only be recorded in a turn a human started.
     assert "ceo_decision" not in {t.name for t in available("strategist", turn)}
     assert "ceo_decision" in {t.name for t in available("strategist", Turn("strategist", [Trigger("human")]))}
@@ -333,6 +334,17 @@ def test_heartbeat_skipped_when_nothing_changed(env):
     assert not any(llm.script.values())
 
 
+def test_own_actions_and_the_trigger_kind_do_not_defeat_skipping(env):
+    world, llm, runner, company = env
+    # A turn started by the CEO, in which the agent only writes itself a note.
+    llm.script["strategist"] = [[call("remember", note="CEO asked about the week; answered")], "done"]
+    company.handle(message(CEO, "plan", "x", "how is the week going?", 9))
+    pump(world, runner, company)
+    world.at = world.at.replace(hour=10)
+    heartbeat(company)
+    assert runner.turns.empty(), "its own note and the CEO trigger are not news for the next heartbeat"
+
+
 def test_requests_from_people_and_bots_are_never_skipped(env):
     world, llm, runner, company = env
     llm.script["strategist"] = ["Nothing to do.", "Answered."]
@@ -354,6 +366,58 @@ def test_an_unfinished_turn_does_not_count_as_seen(env):
     assert world.store.get(fingerprint_key("strategist")) is None
     heartbeat(company)
     assert not runner.turns.empty(), "the next heartbeat runs after a timed-out turn"
+
+
+def editor_turn(runner, script, llm, minutes_later=None, world=None):
+    if minutes_later is not None:
+        world.at = world.at + timedelta(minutes=minutes_later)
+    llm.script["editor"] = script
+    steps, outcome = runner.run_turn(Turn("editor", [Trigger("bot", "writer", "drafts", "draft #1", "review", 1)]))
+    return llm.seen["editor"][-1], outcome
+
+
+def test_a_turn_soon_after_continues_the_conversation(env):
+    world, llm, runner, company = env
+    world.store.add_plan("2026-W41", "Plan text")
+    world.store.add_draft("2026-10-05", "First post", "writer")
+    world.store.add_draft("2026-10-05", "Second post", "writer")
+    first, outcome = editor_turn(runner, [[call("review_draft", draft_id=1, verdict="approve", comments="ok")],
+                                          "reviewed #1"], llm)
+    assert outcome.startswith("fresh") and len(first) == 2 + 2 + 1  # system, user | call, result, reply
+    first_turn = llm.seen["editor"][-1]
+
+    world.store.update_draft(2, status="rejected")
+    world.store.add_draft("2026-10-05", "Third post", "writer")
+    second, outcome = editor_turn(runner, ["nothing else"], llm, minutes_later=10, world=world)
+    assert outcome.startswith("continued")
+    assert second[:len(first_turn)] == first_turn  # the earlier turn, reasoning included, unchanged
+    assert first_turn[2]["reasoning_content"].startswith("thinking before step")
+    update = second[len(first_turn)]
+    text = update["content"]
+    assert update["role"] == "user" and text.startswith("## Since your last turn (09:00)")
+    assert "#3 by writer" in text and "Third post" in text
+    assert "#1 by writer" in text and "editor: approved" in text  # its own review, confirmed
+    assert "#2 is no longer open: it is rejected" in text
+    assert "Plan text" not in text  # unchanged, already above
+    assert text.endswith(clock_line(world, "editor"))
+    assert world.store.get("continued:2026-10-05") == "1"
+
+
+@pytest.mark.parametrize("change", ["late", "next day", "too big", "timed out"])
+def test_otherwise_the_turn_starts_fresh(env, change):
+    world, llm, runner, company = env
+    world.store.add_draft("2026-10-05", "First post", "writer")
+    if change == "timed out":
+        llm.chat = lambda *a, **k: (_ for _ in ()).throw(requests.Timeout())
+        runner.run_turn(Turn("editor", [Trigger("heartbeat")]))
+        llm.chat = ScriptedLLM.chat.__get__(llm)
+    else:
+        editor_turn(runner, ["looked"], llm)
+    minutes = {"late": 16, "next day": 24 * 60}.get(change, 5)
+    if change == "too big":
+        world.cfg.agents.continue_max_chars = 10
+    messages, outcome = editor_turn(runner, ["again"], llm, minutes_later=minutes, world=world)
+    assert outcome.startswith("fresh") and len(messages) == 3  # system, situation, reply
 
 
 def test_migrates_the_fixed_pipeline_database(tmp_path):

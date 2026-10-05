@@ -239,6 +239,7 @@ class Company:
             f"**Agents**: in a turn: {', '.join(sorted(self.running)) or 'none'}; "
             f"waiting to wake: {pending or 'none'}",
             f"**Turns today**: {w.store.get(f'turns:{w.today()}', '0')}/{self.cfg.agents.max_turns_per_day}, "
+            f"{w.store.get(f'continued:{w.today()}', '0')} of them continuing the agent's previous conversation, "
             f"plus {w.store.get(f'skipped:{w.today()}', '0')} heartbeats skipped because nothing had changed",
             f"**Plan for {w.week()}**: {'yes' if w.store.latest_plan(w.week()) else 'not yet'}",
             f"**Open drafts**: {', '.join(f'#{d.id}' for d in drafts) or 'none'}; "

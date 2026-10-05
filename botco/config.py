@@ -61,6 +61,11 @@ class Agents:
     max_turns_per_day: int = 300
     # Every tool call is logged in #ops > activity.
     activity_log: bool = True
+    # An agent woken again within this many minutes, the same day, continues
+    # its last conversation with an update instead of a fresh situation...
+    continue_minutes: int = 15
+    # ...unless that conversation has grown past this size (~60K tokens).
+    continue_max_chars: int = 200000
 
 
 @dataclass
