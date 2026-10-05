@@ -7,6 +7,7 @@ lock; tool calls and context building hold it.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import logging
@@ -76,7 +77,7 @@ def chat_window(w: World) -> list[dict]:
     return (today if len(today) >= 20 else msgs[-20:])[-80:]
 
 
-def situation(w: World, turn: Turn) -> str:
+def situation(w: World, turn: Turn, clock: bool = True) -> str:
     """Everything the agent knows at the start of its turn.
 
     Ordered from what changes least to what changes most, because the server
@@ -85,7 +86,7 @@ def situation(w: World, turn: Turn) -> str:
     plan, published posts), then this agent's role and notes, then what moves
     during the day (chat, drafts, queue), and the reason for the turn and the
     time last."""
-    cfg, store, now = w.cfg, w.store, w.now()
+    cfg, store = w.cfg, w.store
     need_ceo = cfg.publishing.ceo_approval
     parts = []
 
@@ -154,9 +155,31 @@ def situation(w: World, turn: Turn) -> str:
         awake += ("\nA human wrote to you: answer them in the same topic with send_message. "
                   "If they stated a decision about a draft, record it with ceo_decision.")
     parts.append(awake)
-    parts.append(f"It is {now:%A %Y-%m-%d %H:%M} ({cfg.timezone}). You are the {turn.agent}. "
-                 "Now act. Use tools; when you have nothing more to do, reply with a one-line summary.")
+    if clock:
+        parts.append(clock_line(w, turn.agent))
     return "\n\n".join(parts)
+
+
+def clock_line(w: World, agent: str) -> str:
+    """The only part of the prompt that changes by itself, last on purpose."""
+    return (f"It is {w.now():%A %Y-%m-%d %H:%M} ({w.cfg.timezone}). You are the {agent}. "
+            "Now act. Use tools; when you have nothing more to do, reply with a one-line summary.")
+
+
+def request(w: World, turn: Turn) -> tuple[list[dict], list[dict], str]:
+    """The messages and tools of a turn's first model call, and a fingerprint
+    of everything in them except the clock line: equal fingerprints mean the
+    agent would see exactly what it saw before. Call it holding w.lock."""
+    system, body = system_prompt(w), situation(w, turn, clock=False)
+    clock = clock_line(w, turn.agent)
+    specs = [t.spec() for t in tools.offered(w.lab is not None)]
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": f"{body}\n\n{clock}"}]
+    data = json.dumps([system, body, [t["function"]["name"] for t in specs]])
+    return messages, specs, hashlib.sha256(data.encode()).hexdigest()
+
+
+def fingerprint_key(agent: str) -> str:
+    return f"fingerprint:{agent}"
 
 
 class Runner:
@@ -209,11 +232,7 @@ class Runner:
     def run_turn(self, turn: Turn) -> tuple[int, str]:
         w, persona = self.w, self.w.cfg.personas[turn.agent]
         with w.lock:
-            messages = [
-                {"role": "system", "content": system_prompt(w)},
-                {"role": "user", "content": situation(w, turn)},
-            ]
-            specs = [t.spec() for t in tools.offered(w.lab is not None)]
+            messages, specs, fingerprint = request(w, turn)
         steps, reply = 0, None
         while steps < w.cfg.agents.max_steps:
             if w.halted.is_set():
@@ -246,4 +265,8 @@ class Runner:
             t = asked[-1]
             with w.lock:
                 tools.execute(w, turn, "send_message", json.dumps({"stream": t.stream, "topic": t.topic, "content": reply["content"]}))
+        # Only a turn that ran to its end records what it saw: after a timeout
+        # or a halt, the next heartbeat must not be skipped as "seen".
+        with w.lock:
+            w.store.put(fingerprint_key(turn.agent), fingerprint)
         return steps, (reply["content"][:200] if reply else "")

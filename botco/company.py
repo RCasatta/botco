@@ -22,7 +22,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 from . import text as T
-from .agents import Notice, Runner, TurnDone
+from .agents import Notice, Runner, TurnDone, fingerprint_key, request
 from .config import AGENTS
 from .tools import Trigger, Turn
 from .world import World, quote
@@ -141,6 +141,12 @@ class Company:
                 return
             triggers = self.pending[agent]
             turn = Turn(agent, triggers)
+            if self.unchanged(turn):
+                self.pending[agent] = []
+                self.last_turn[agent] = self.w.now()
+                self.w.store.incr(f"skipped:{self.w.today()}")
+                log.info("%s: heartbeat skipped, nothing changed since its last turn", agent)
+                continue
             key = f"turns:{self.w.today()}"
             if int(self.w.store.get(key, "0")) >= self.cfg.agents.max_turns_per_day and not turn.human:
                 self.notify_once(key, f":octagonal_sign: {self.cfg.agents.max_turns_per_day} agent turns today: "
@@ -151,6 +157,16 @@ class Company:
             self.pending[agent] = []
             self.running.add(agent)
             self.runner.submit(turn)
+
+    def unchanged(self, turn: Turn) -> bool:
+        """A heartbeat whose agent would see exactly what it saw at the start
+        of its last completed turn, apart from the clock: running it would
+        cost a full prefill and some thinking to conclude "nothing to do"
+        again. Turns anyone asked for always run."""
+        if any(t.kind != "heartbeat" for t in turn.triggers):
+            return False
+        seen = self.w.store.get(fingerprint_key(turn.agent))
+        return seen is not None and seen == request(self.w, turn)[2]
 
     # Zulip events
 
@@ -222,7 +238,8 @@ class Company:
             f"**Inference**: {'down' if self.runner.down else 'up'}",
             f"**Agents**: in a turn: {', '.join(sorted(self.running)) or 'none'}; "
             f"waiting to wake: {pending or 'none'}",
-            f"**Turns today**: {w.store.get(f'turns:{w.today()}', '0')}/{self.cfg.agents.max_turns_per_day}",
+            f"**Turns today**: {w.store.get(f'turns:{w.today()}', '0')}/{self.cfg.agents.max_turns_per_day}, "
+            f"plus {w.store.get(f'skipped:{w.today()}', '0')} heartbeats skipped because nothing had changed",
             f"**Plan for {w.week()}**: {'yes' if w.store.latest_plan(w.week()) else 'not yet'}",
             f"**Open drafts**: {', '.join(f'#{d.id}' for d in drafts) or 'none'}; "
             f"ready to publish: {', '.join(f'#{d.id}' for d in ready) or 'none'}",

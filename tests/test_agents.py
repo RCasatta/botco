@@ -8,8 +8,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+import requests
 
-from botco.agents import Runner, TurnDone, situation, system_prompt
+from botco.agents import Runner, TurnDone, fingerprint_key, situation, system_prompt
 from botco.breakers import Breakers
 from botco.company import Company
 from botco.config import AGENTS, Agents, Breakers as BreakerConfig, Config, LLMConfig, Persona, Publishing
@@ -306,6 +307,53 @@ def test_requests_share_their_beginning_across_agents_and_turns(env):
     assert "Plan text" in shared and "## Publishing" in shared
     assert all(t.startswith(shared) for t in texts)
     assert all(t.rindex("It is Monday") > t.index("## Open drafts") > t.index("## Your role") for t in texts)
+
+
+def heartbeat(company, agent="strategist"):
+    company.pending[agent].append(Trigger("heartbeat"))
+    company.schedule()
+
+
+def test_heartbeat_skipped_when_nothing_changed(env):
+    world, llm, runner, company = env
+    llm.script["strategist"] = ["Nothing to do."]
+    heartbeat(company)
+    pump(world, runner, company)  # runs, and records what it saw
+    world.at = world.at.replace(hour=10)  # an hour later: only the clock moved
+    heartbeat(company)
+    assert runner.turns.empty() and not company.pending["strategist"]
+    assert world.store.get("skipped:2026-10-05") == "1"
+    assert world.store.get("turns:2026-10-05") == "1"  # skips use no budget
+
+    world.store.add_draft("2026-10-05", "Something new", "writer")
+    llm.script["strategist"] = ["Saw the new draft."]
+    heartbeat(company)
+    assert not runner.turns.empty(), "a change makes the heartbeat run"
+    pump(world, runner, company)
+    assert not any(llm.script.values())
+
+
+def test_requests_from_people_and_bots_are_never_skipped(env):
+    world, llm, runner, company = env
+    llm.script["strategist"] = ["Nothing to do.", "Answered."]
+    heartbeat(company)
+    pump(world, runner, company)
+    company.handle(message(CEO, "plan", "x", "anything new?", 9))  # same state, but someone asked
+    company.schedule()
+    assert not runner.turns.empty()
+
+
+def test_an_unfinished_turn_does_not_count_as_seen(env):
+    world, llm, runner, company = env
+
+    def timeout(*a, **k):
+        raise requests.Timeout()
+    llm.chat = timeout
+    heartbeat(company)
+    pump(world, runner, company)
+    assert world.store.get(fingerprint_key("strategist")) is None
+    heartbeat(company)
+    assert not runner.turns.empty(), "the next heartbeat runs after a timed-out turn"
 
 
 def test_migrates_the_fixed_pipeline_database(tmp_path):
