@@ -131,7 +131,7 @@ def revise_draft(w: World, turn: Turn, a: dict) -> str:
 
 def review_draft(w: World, turn: Turn, a: dict) -> str:
     d = _open_draft(w, a["draft_id"])
-    verdict, comments = a["verdict"], a.get("comments", "").strip()
+    verdict, comments = a["verdict"], fix_mentions(w, a.get("comments", "").strip())
     if verdict == "approve":
         w.store.update_draft(d.id, editor_ok=1, feedback=comments)
         waits = " It now waits for the CEO's approval." if w.cfg.publishing.ceo_approval and not d.ceo_ok else ""
@@ -224,7 +224,8 @@ TOOLS = [
          required=["draft_id", "text"]),
     Tool("review_draft",
          "Editor only. Give your verdict on an open draft: approve (publishable as is), revise (fixable, "
-         "say how in comments) or reject (not worth fixing).",
+         "say how in comments) or reject (not worth fixing). The review is posted in the draft's topic for you; "
+         "mention a teammate in the comments to wake them.",
          {"draft_id": I, "verdict": {"type": "string", "enum": ["approve", "revise", "reject"]}, "comments": S},
          review_draft, agents=("editor",), required=["draft_id", "verdict", "comments"]),
     Tool("ceo_decision",

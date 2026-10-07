@@ -196,6 +196,18 @@ def test_tools_enforce_the_rules(env):
     assert "ceo_decision" in {t.name for t in available("strategist", Turn("strategist", [Trigger("human")]))}
 
 
+def test_a_review_calls_the_writer_from_its_comments(env):
+    world, llm, runner, company = env
+    world.store.add_draft("2026-10-05", "A post", "writer")
+    llm.script["editor"] = [[call("review_draft", draft_id=1, verdict="revise", comments="@writer name the source")],
+                            "done"]
+    runner.run_turn(Turn("editor", [Trigger("heartbeat")]))
+    (review,) = world.team.sent("editor")
+    assert "@**writer** name the source" in review["content"]
+    company.handle({"type": "message", "message": review})
+    assert company.pending["writer"], "the mention in the review wakes the writer"
+
+
 def test_plain_text_answer_to_a_bot_is_not_posted(env):
     world, llm, runner, company = env
     llm.script["writer"] = ["Nothing to do."]
