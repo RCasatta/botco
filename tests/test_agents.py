@@ -550,6 +550,7 @@ def test_the_sandbox_command(env):
     props = [argv[i + 1] for i, a in enumerate(argv) if a == "-p"]
     assert "PrivateDevices=yes" in props and "IPAddressDeny=any" in props
     assert "BindReadOnlyPaths=/srv/repos:/srv/repos" in props
+    assert "GIT_CONFIG_VALUE_0=*" in [argv[i + 1] for i, a in enumerate(argv) if a == "-E"]
     assert "InaccessiblePaths=-/srv/repos/.ssh -/srv/repos/.pi" in props and "SupplementaryGroups=users" in props
     world.cfg.accounts["dev"].engine.skills = ["/srv/skills"]
     argv, envs, unit = runner.sessions.command("dev", 4, "do it")

@@ -195,7 +195,10 @@ class Sessions:
         exe = shutil.which(e.cmd) or e.cmd
         skills = [a for path in e.skills for a in ("--skill", path)]
         pi = [exe, "-p", "--provider", "botco", "--model", m.id, "--no-session", *skills, "--", prompt]
-        env = {"PI_CODING_AGENT_DIR": str(agent), "HOME": str(ws), "PI_OFFLINE": "1", "PI_TELEMETRY": "0"}
+        env = {"PI_CODING_AGENT_DIR": str(agent), "HOME": str(ws), "PI_OFFLINE": "1", "PI_TELEMETRY": "0",
+               # The read-only repositories belong to someone else, which git
+               # refuses ("dubious ownership") unless told otherwise.
+               "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*"}
         if not e.gpu:
             env["CUDA_VISIBLE_DEVICES"] = ""
         if e.pi_config:
