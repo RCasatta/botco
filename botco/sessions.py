@@ -14,6 +14,7 @@ import getpass
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
@@ -307,6 +308,34 @@ class Sessions:
                 run.proc.wait(timeout=30)
             except (ProcessLookupError, subprocess.TimeoutExpired):
                 pass
+
+    def systemctl(self, *args: str) -> str:
+        r = subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=60)
+        return r.stdout
+
+    def stop_leftovers(self) -> list[int]:
+        """Stop the sandboxed sessions an earlier botco started: they outlive
+        it, nobody would read their result, and they would run next to a new
+        session on the same workspace. Returns their tasks."""
+        if not any(a.engine and a.engine.kind == "session" and a.engine.sandbox for a in self.w.cfg.accounts.values()):
+            return []
+        try:
+            out = self.systemctl("list-units", "botco-session-*", "--plain", "--no-legend", "--state=active,activating")
+        except (OSError, subprocess.SubprocessError):
+            log.exception("listing leftover sessions")
+            return []
+        tasks = []
+        for line in out.splitlines():
+            m = re.match(r"(botco-session-(\d+)-\d+\.service)\s", line + " ")
+            if not m:
+                continue
+            log.warning("stopping %s, left by an earlier botco", m.group(1))
+            try:
+                self.systemctl("stop", m.group(1))
+            except (OSError, subprocess.SubprocessError):
+                log.exception("stopping %s", m.group(1))
+            tasks.append(int(m.group(2)))
+        return tasks
 
     def stop(self, task: int, by: str) -> bool:
         run = self.running.get(task)

@@ -507,6 +507,22 @@ def test_a_person_can_stop_a_session(env):
     assert any("Stopping the session" in m["content"] for m in world.team.sent("publisher"))
 
 
+def test_sessions_left_by_an_earlier_botco_are_stopped_and_started_again(env):
+    world, llm, runner, company = env
+    t, _ = Tracker(world).create("riccardo", "task", "Long job", assignee="dev")
+    drain(world, company)
+    company.session_queue.clear()
+    calls = []
+    runner.sessions.systemctl = lambda *a: calls.append(a) or (
+        f"botco-session-{t.id}-1791554809.service loaded active running [systemd-run] pi\n" if a[0] == "list-units" else "")
+    assert runner.sessions.stop_leftovers() == [], "unsandboxed sessions die with botco"
+    world.cfg.accounts["dev"].engine.sandbox = True
+    company.restart_sessions(runner.sessions.stop_leftovers())
+    assert ("stop", f"botco-session-{t.id}-1791554809.service") in calls
+    assert "interrupted by a botco restart" in world.store.comments(t.id)[-1].text
+    assert ("dev", t.id) in company.session_queue
+
+
 def test_sessions_use_only_their_slot(env):
     world, llm, runner, company = env
     company.running_sessions[1] = ("dev", "local")

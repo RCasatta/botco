@@ -101,6 +101,8 @@ class Company:
             w.team.setup_streams()
         w.team.listen(w.inbox)
         self.runner.start()
+        with w.lock:
+            self.restart_sessions(self.runner.sessions.stop_leftovers())
         threading.Thread(target=self._poll_loop, name="external", daemon=True).start()
         state = "**halted** (send `resume` to start)" if w.halted.is_set() else "running"
         mode = "dry run, nothing is posted to X" if self.cfg.x.dry_run else "live on X"
@@ -218,6 +220,19 @@ class Company:
         elif a and a.engine is None:
             self.tracker.post(self.cfg.publisher, t, f"{self.w.team.mention(t.author)} {done.account}'s session on "
                                                      f"#{t.id} ended ({done.outcome}).")
+
+    def restart_sessions(self, tasks: list[int]) -> None:
+        """Sessions cut short by a restart start again on their task."""
+        for task_id in tasks:
+            t = self.w.store.task(task_id)
+            if t is None or not t.open or not t.assignee:
+                continue
+            a = self.cfg.accounts.get(t.assignee)
+            if not (a and a.engine and a.engine.kind == "session"):
+                continue
+            self.tracker.comment(t.assignee, t, "Session interrupted by a botco restart; starting a new one on the "
+                                                "same workspace.", check=False)
+            self.session_queue.setdefault((t.assignee, t.id), SessionJob(t.assignee, t.id, "restart"))
 
     # starting work
 
