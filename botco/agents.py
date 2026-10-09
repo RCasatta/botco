@@ -1,5 +1,5 @@
-"""Agent turns: an agent wakes up, reads the situation, and acts through
-tools until it has nothing more to do.
+"""The turn engine: an account wakes up, reads the situation, and acts
+through the five tools until it has nothing more to do.
 
 Turns run on worker threads. The model is called without holding the world
 lock; tool calls and context building hold it.
@@ -8,10 +8,8 @@ lock; tool calls and context building hold it.
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import logging
-import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -21,8 +19,10 @@ from importlib import resources
 import requests
 
 from . import tools
-from .llm import LLM, LLMDown
-from .store import Draft
+from .config import TurnEngine
+from .llm import LLMDown
+from .sessions import SessionDone, SessionJob, Sessions
+from .store import Task
 from .tools import Trigger, Turn
 from .world import World, quote
 
@@ -47,12 +47,33 @@ def prompt(name: str) -> str:
     return resources.files("botco").joinpath(f"prompts/{name}.md").read_text()
 
 
+def has_prompt(name: str) -> bool:
+    return resources.files("botco").joinpath(f"prompts/{name}.md").is_file()
+
+
 def system_prompt(w: World) -> str:
-    """The same for every agent: the role comes later, in the situation, so
-    the server can reuse its cache for this part across agents."""
+    """The same for every account: the role comes later, in the situation,
+    so the server can reuse its cache for this part across accounts."""
+    cfg = w.cfg
+    people, members = [], []
+    for a in cfg.accounts.values():
+        roles = ", ".join(a.roles) or "no role"
+        if a.engine is None and a.zulip:
+            people.append(f"  - {a.name} ({roles}), a person: mention as {w.team.mention(a.name)}")
+        elif a.engine is not None:
+            how = "works in short turns like you" if a.engine.kind == "turn" else \
+                "works alone on one task at a time in a sandbox and reports a summary; it cannot chat"
+            members.append(f"  - {a.name} ({roles}): {how}")
+    kinds = []
+    for k in cfg.kinds.values():
+        rule = (f"needs an approval of its current body from each of: {', '.join(k.approve)}" if k.approve
+                else "waits on its assignee until they close it")
+        extra = (", then the publisher posts it to X" if k.sink == "x" else "") + \
+                ("; only one is open at a time" if k.one_open else "")
+        kinds.append(f"  - {k.name}: {rule}{extra}. Topics in #{k.stream}.")
     team = prompt("team").format(
-        drafts=w.cfg.streams.drafts, plan=w.cfg.streams.plan, ops=w.cfg.streams.ops,
-        published=w.cfg.streams.published, coordinator=w.cfg.agents.coordinator, ceo=w.team.ceo,
+        people="\n".join(people) or "  - (none configured)", members="\n".join(members),
+        kinds="\n".join(kinds), ops=cfg.streams.ops, published=cfg.streams.published,
     )
     return f"{prompt('common')}\n\n{team}"
 
@@ -63,8 +84,10 @@ def describe_trigger(t: Trigger) -> str:
     if t.kind == "lab":
         return (f"- The lab notebook changed: {t.content}. New results can be material for posts; "
                 "read what changed and decide whether the plan or the writer should use it.")
-    who = "the CEO" if t.kind == "human" else t.sender
-    return f"- {who} wrote in #{t.stream} > {t.topic}:\n{quote(t.content[:2000])}"
+    if t.kind == "task":
+        return f"- #{t.task}: {t.content}"
+    who = t.sender if t.kind == "bot" else f"{t.sender} (a person{', ' + t.account if t.account else ''})"
+    return f"- {who} wrote in #{t.stream} > {t.topic} (message {t.msg_id}):\n{quote(t.content[:2000])}"
 
 
 def team_messages(w: World) -> list[dict]:
@@ -93,37 +116,54 @@ def chat_line(m: dict) -> str:
 
 
 def lab_line(n) -> str:
-    return f"- `{n.path}` ({n.modified:%Y-%m-%d}, {n.size // 1000} KB): {n.title}"
+    return f"- `lab:{n.path}` ({n.modified:%Y-%m-%d}, {n.size // 1000} KB): {n.title}"
 
 
 def lab_section(w: World) -> str | None:
     if not (w.lab and w.lab.available()):
         return None
-    return ("## Lab notebook (our own experiments on this machine; read with read_lab_note)\n"
-            + "\n".join(lab_line(n) for n in w.lab.notes()))
+    return ("## Lab notebook (our own experiments on this machine; read a report with read, e.g. "
+            "`lab:FILE.md#Section`)\n" + "\n".join(lab_line(n) for n in w.lab.notes()))
 
 
-def plan_section(w: World) -> str:
-    plan = w.store.latest_plan(w.week())
-    if plan:
-        return f"## Content plan for {w.week()}\n{plan['text']}"
-    last = w.store.latest_plan()
-    return (f"## Content plan\nThere is no plan for {w.week()} yet."
-            + (f" Last week's plan ({last['week']}):\n{last['text']}" if last else ""))
+def standing_tasks(w: World) -> list[Task]:
+    """Open tasks of kinds with one open at a time, like the weekly plan:
+    everyone works from them."""
+    out = []
+    for k in w.cfg.kinds.values():
+        if k.one_open:
+            out += w.store.open_tasks(k.name)
+    return out
 
 
-def published_line(d: Draft) -> str:
-    return f"- [{d.published_at[:16]}] {d.text}"
+def standing_section(w: World) -> str | None:
+    parts = []
+    for k in w.cfg.kinds.values():
+        if not k.one_open:
+            continue
+        found = w.store.open_tasks(k.name)
+        if found:
+            t = found[-1]
+            parts.append(f"## Current {k.name}: #{t.id} {t.title} (version {t.version}, by {t.author})\n{t.body}")
+        else:
+            parts.append(f"## Current {k.name}\nThere is no open {k.name}.")
+    return "\n\n".join(parts) or None
 
 
-def publishing_section(w: World) -> str:
-    cfg = w.cfg
-    times = ", ".join(t.strftime("%H:%M") for t in cfg.publishing.times)
-    gate = "the editor and the CEO" if cfg.publishing.ceo_approval else "the editor"
-    pub = [f"The publisher (a script) posts to X at {times}: each time, the oldest draft approved by {gate}."]
+def published_line(t: Task) -> str:
+    return f"- [{(t.closed_at or '')[:16]}] {t.body}"
+
+
+def publishing_section(w: World) -> str | None:
+    kinds = [k for k in w.cfg.kinds.values() if k.sink == "x"]
+    if not kinds:
+        return None
+    times = ", ".join(t.strftime("%H:%M") for t in w.cfg.x.times)
+    pub = [f"The publisher (a script) posts to X at {times}: each time, the oldest {kinds[0].name} "
+           f"approved by {' and '.join(kinds[0].approve) or 'nobody'}."]
     recent = w.store.published(10)
     if recent:
-        pub.append("Recently published, newest first:\n" + "\n".join(published_line(d) for d in recent))
+        pub.append("Recently published, newest first:\n" + "\n".join(published_line(t) for t in recent))
     return "## Publishing\n" + "\n".join(pub)
 
 
@@ -135,69 +175,101 @@ def note_line(n) -> str:
     return f"- [{n['created_at'][:10]}] {n['text']}"
 
 
-def draft_block(w: World, d: Draft) -> str:
-    state = f"editor: {'approved' if d.editor_ok else 'not approved'}"
-    if w.cfg.publishing.ceo_approval:
-        state += f", CEO: {'approved' if d.ceo_ok else 'not approved'}"
-    lines = [f"### #{d.id} by {d.author}, version {d.revisions + 1} ({state})\n{quote(d.text)}"]
-    if d.note:
-        lines.append(f"Author's note: {d.note}")
-    if d.feedback:
-        lines.append(f"Editor's latest comments: {d.feedback}")
+def task_block(w: World, t: Task) -> str:
+    """A task in full, as an account it waits on needs it."""
+    policy, store = w.policy, w.store
+    waiting = policy.waits_on(store, t)
+    head = f"### #{t.id} {t.kind} by {t.author}, version {t.version}: {t.title}"
+    state = f"Waits on: {', '.join(waiting.accounts) or 'nobody'} ({waiting.why})"
+    if policy.kind(t.kind).approve:
+        state += f". Approvals of this version: {policy.approvals(store, t)}"
+    lines = [head, state]
+    extra = [f"assignee: {t.assignee}" if t.assignee and t.assignee != t.author else "",
+             f"refs: {', '.join(t.refs)}" if t.refs else "", f"labels: {', '.join(t.labels)}" if t.labels else ""]
+    if any(extra):
+        lines.append("; ".join(e for e in extra if e))
+    if t.body:
+        lines.append(quote(t.body))
+    if t.note:
+        lines.append(f"Author's note: {t.note}")
+    reviews = [r for r in store.reviews(t.id) if r.body_hash == t.hash]
+    if reviews:
+        lines.append("Reviews of this version:\n" + "\n".join(
+            f"- {r.account}: {r.verdict}" + (f" ({r.comments})" if r.comments else "") for r in reviews))
+    comments = store.comments(t.id, 5)
+    if comments:
+        lines.append("Latest comments:\n" + "\n".join(f"- {c.author}: {c.text[:500]}" for c in comments))
     return "\n".join(lines)
 
 
-def queue_section(w: World) -> str:
-    ready = w.store.ready(w.cfg.publishing.ceo_approval)
+def task_line(w: World, t: Task) -> str:
+    waiting = w.policy.waits_on(w.store, t)
+    return f"- #{t.id} {t.kind} by {t.author}: {t.title}. Waits on {', '.join(waiting.accounts) or 'nobody'} ({waiting.why})"
+
+
+def waiting_on(w: World, account: str) -> list[Task]:
+    return [t for t in w.store.open_tasks() if account in w.policy.waits_on(w.store, t).accounts]
+
+
+def queue_section(w: World) -> str | None:
+    kinds = {k.name for k in w.cfg.kinds.values() if k.sink == "x"}
+    if not kinds:
+        return None
+    ready = [t for t in w.store.open_tasks() if t.kind in kinds and w.policy.waits_on(w.store, t).ready]
     return (f"## Publishing queue\nPublished today: {w.published_on(w.today())}. "
-            f"Ready to publish: {', '.join(f'#{d.id}' for d in ready) or 'none'}.")
+            f"Ready to publish: {', '.join(f'#{t.id}' for t in ready) or 'none'}.")
 
 
 def awake_section(turn: Turn) -> str:
     awake = "## Why you are awake\n" + "\n".join(describe_trigger(t) for t in turn.triggers)
     if turn.human:
-        awake += ("\nA human wrote to you: answer them in the same topic with send_message. "
-                  "If they stated a decision about a draft, record it with ceo_decision.")
+        awake += ("\nA person wrote to you: answer them with comment, on the task or in the same topic. If they "
+                  "stated a verdict on a task, record it with comment, the verdict and on_behalf_of set to the id "
+                  "of their message.")
     return awake
 
 
 def situation(w: World, turn: Turn, clock: bool = True) -> str:
-    """Everything the agent knows at the start of a fresh turn.
+    """Everything the account knows at the start of a fresh turn.
 
     Ordered from what changes least to what changes most, because the server
     reuses its cache only up to the first difference from an earlier
-    request: first what every agent shares and rarely changes (lab index,
-    plan, published posts), then this agent's role and notes, then what moves
-    during the day (chat, drafts, queue), and the reason for the turn and the
-    time last."""
+    request: first what every account shares and rarely changes (lab index,
+    plan, published posts), then this account's role and notes, then what
+    moves during the day (chat, tasks, queue), and the reason for the turn and
+    the time last."""
     cfg, store = w.cfg, w.store
+    engine = cfg.accounts[turn.agent].engine
     parts = []
 
-    # Shared by every agent, changes rarely.
-    if lab := lab_section(w):
-        parts.append(lab)
-    parts.append(plan_section(w))
-    parts.append(publishing_section(w))
+    # Shared by every account, changes rarely.
+    for section in (lab_section(w), standing_section(w), publishing_section(w)):
+        if section:
+            parts.append(section)
     metrics = store.metrics(7)
     if metrics:
         parts.append("## Followers\n" + "\n".join(followers_line(m) for m in metrics))
 
-    # This agent.
-    parts.append(f"## Your role\n{prompt(turn.agent)}")
+    # This account.
+    parts.append(f"## Your role\n{prompt(engine.persona)}")
     notes = store.notes(turn.agent)
     if notes:
         parts.append("## Your notes\n" + "\n".join(note_line(n) for n in notes))
-    if turn.agent == "strategist" and cfg.reference_file and cfg.reference_file.exists():
-        parts.append("## Posts by accounts the CEO likes (for tone and topics; never copy)\n"
+    if engine.persona == "strategist" and cfg.reference_file and cfg.reference_file.exists():
+        parts.append("## Posts by accounts the owner likes (for tone and topics; never copy)\n"
                      + cfg.reference_file.read_text()[:6000])
 
     # Moves during the day.
     msgs = chat_window(w)
     if msgs:
         parts.append("## Team chat, oldest first\n" + "\n".join(chat_line(m) for m in msgs))
-    blocks = [draft_block(w, d) for d in store.open_drafts()]
-    parts.append("## Open drafts\n" + ("\n".join(blocks) if blocks else "None."))
-    parts.append(queue_section(w))
+    mine = waiting_on(w, turn.agent)
+    skip = {t.id for t in mine} | {t.id for t in standing_tasks(w)}
+    others = [t for t in store.open_tasks() if t.id not in skip]
+    parts.append("## Waiting on you\n" + ("\n\n".join(task_block(w, t) for t in mine) if mine else "Nothing."))
+    parts.append("## Other open tasks\n" + ("\n".join(task_line(w, t) for t in others) if others else "None."))
+    if q := queue_section(w):
+        parts.append(q)
 
     # This turn.
     parts.append(awake_section(turn))
@@ -206,13 +278,18 @@ def situation(w: World, turn: Turn, clock: bool = True) -> str:
     return "\n\n".join(parts)
 
 
+def task_state(w: World, t: Task) -> tuple:
+    return (t.status, t.version, t.hash, t.assignee, t.title, len(w.store.reviews(t.id)),
+            len(w.store.comments(t.id, 1000)), tuple(w.policy.waits_on(w.store, t).accounts))
+
+
 @dataclass
 class Snapshot:
-    """What an agent saw at the start of a turn, to tell it later what changed."""
+    """What an account saw at the start of a turn, to tell it later what
+    changed."""
 
     chat_id: int
-    drafts: dict[int, tuple]
-    plan_id: int | None
+    tasks: dict[int, tuple]
     published: set[int]
     metrics: set[str]
     lab: dict[str, str]
@@ -220,13 +297,10 @@ class Snapshot:
 
 
 def snapshot(w: World, agent: str, msgs: list[dict]) -> Snapshot:
-    plan = w.store.latest_plan(w.week())
     return Snapshot(
         chat_id=max((m["id"] for m in msgs), default=0),
-        drafts={d.id: (d.status, d.editor_ok, d.ceo_ok, d.revisions, d.text, d.note, d.feedback)
-                for d in w.store.open_drafts()},
-        plan_id=plan["id"] if plan else None,
-        published={d.id for d in w.store.published(10)},
+        tasks={t.id: task_state(w, t) for t in w.store.open_tasks()},
+        published={t.id for t in w.store.published(10)},
         metrics={m["day"] for m in w.store.metrics(7)},
         lab={n.path: n.modified.isoformat() for n in w.lab.notes()} if w.lab and w.lab.available() else {},
         notes={n["id"] for n in w.store.notes(agent)},
@@ -235,19 +309,25 @@ def snapshot(w: World, agent: str, msgs: list[dict]) -> Snapshot:
 
 def delta(w: World, turn: Turn, since: datetime, old: Snapshot, new: Snapshot, msgs: list[dict]) -> str:
     """The user message that continues a conversation: what changed since
-    the agent's last turn, then the queue, the reason and the time, as at the
-    end of a fresh situation."""
+    the account's last turn, then the queue, the reason and the time, as at
+    the end of a fresh situation."""
     store, changes = w.store, []
     chat = [chat_line(m) for m in msgs if m["id"] > old.chat_id]
     if chat:
         changes.append("### New chat messages\n" + "\n".join(chat))
-    drafts = [draft_block(w, store.draft(i)) for i, state in new.drafts.items() if old.drafts.get(i) != state]
-    drafts += [f"#{i} is no longer open: it is {store.draft(i).status}." for i in old.drafts if i not in new.drafts]
-    if drafts:
-        changes.append("### Drafts, new or changed\n" + "\n".join(drafts))
-    if new.plan_id != old.plan_id:
-        changes.append("### The plan changed\n" + plan_section(w).split("\n", 1)[1])
-    published = [published_line(d) for d in store.published(10) if d.id not in old.published]
+    mine = {t.id for t in waiting_on(w, turn.agent)}
+    changed = [store.task(i) for i, state in new.tasks.items() if old.tasks.get(i) != state]
+    blocks = [task_block(w, t) for t in changed if t.id in mine]
+    lines = [task_line(w, t) for t in changed if t.id not in mine]
+    lines += [f"- #{i} is closed: {store.task(i).resolution}." for i in old.tasks if i not in new.tasks]
+    if blocks:
+        changes.append("### Waiting on you, new or changed\n" + "\n\n".join(blocks))
+    if lines:
+        changes.append("### Other tasks, new, changed or closed\n" + "\n".join(lines))
+    standing = [t for t in standing_tasks(w) if old.tasks.get(t.id) != new.tasks.get(t.id)]
+    for t in standing:
+        changes.append(f"### The current {t.kind} changed: #{t.id} {t.title} (version {t.version})\n{t.body}")
+    published = [published_line(t) for t in store.published(10) if t.id not in old.published]
     if published:
         changes.append("### Newly published\n" + "\n".join(published))
     followers = [followers_line(m) for m in store.metrics(7) if m["day"] not in old.metrics]
@@ -263,7 +343,8 @@ def delta(w: World, turn: Turn, since: datetime, old: Snapshot, new: Snapshot, m
     head = (f"## Since your last turn ({since:%H:%M})\n"
             "This continues your conversation; everything above still holds unless changed here.")
     body = "\n\n".join(changes) if changes else "Nothing changed besides what follows."
-    return "\n\n".join([head, body, queue_section(w), awake_section(turn), clock_line(w, turn.agent)])
+    tail = [s for s in (queue_section(w), awake_section(turn), clock_line(w, turn.agent)) if s]
+    return "\n\n".join([head, body, *tail])
 
 
 def clock_line(w: World, agent: str) -> str:
@@ -275,10 +356,10 @@ def clock_line(w: World, agent: str) -> str:
 def request(w: World, turn: Turn) -> tuple[list[dict], list[dict], str]:
     """The messages and tools of a turn's first model call, and a fingerprint
     of everything in them except the clock line: equal fingerprints mean the
-    agent would see exactly what it saw before. Call it holding w.lock."""
+    account would see exactly what it saw before. Call it holding w.lock."""
     system, body = system_prompt(w), situation(w, turn, clock=False)
     clock = clock_line(w, turn.agent)
-    specs = [t.spec() for t in tools.offered(w.lab is not None)]
+    specs = [t.spec() for t in tools.TOOLS]
     messages = [{"role": "system", "content": system}, {"role": "user", "content": f"{body}\n\n{clock}"}]
     data = json.dumps([system, body, [t["function"]["name"] for t in specs]])
     return messages, specs, hashlib.sha256(data.encode()).hexdigest()
@@ -290,9 +371,9 @@ def fingerprint_key(agent: str) -> str:
 
 @dataclass
 class Conversation:
-    """An agent's last completed turn, kept so a turn soon after can continue
-    it: the server then finds the whole earlier conversation in its cache and
-    only reads the update."""
+    """An account's last completed turn, kept so a turn soon after can
+    continue it: the server then finds the whole earlier conversation in its
+    cache and only reads the update."""
 
     messages: list[dict]
     specs: list[dict]
@@ -307,62 +388,82 @@ class Conversation:
 
 
 class Runner:
-    def __init__(self, world: World, llm: LLM, inbox: queue.Queue):
+    """Runs turns and sessions on worker threads, one thread per job; the
+    dispatcher decides when a job may start."""
+
+    def __init__(self, world: World, llms: dict, sessions: Sessions | None = None):
         self.w = world
-        self.llm = llm
-        self.inbox = inbox
-        self.turns: queue.PriorityQueue = queue.PriorityQueue()
-        self.seq = itertools.count()
+        # Model name -> LLM client.
+        self.llms = llms
+        self.sessions = sessions or Sessions(world)
         self.down = False
         self._down_lock = threading.Lock()
-        # Per agent; only touched by the agent's own turn, under w.lock.
+        # Per account; only touched by the account's own turn, under w.lock.
         self.convos: dict[str, Conversation] = {}
+        # Without start(), jobs wait here for a test to run them.
+        self.threaded = False
+        self.queued: list = []
 
     def can_continue(self, convo: Conversation | None, specs: list[dict]) -> bool:
-        a, w = self.w.cfg.agents, self.w
+        d, w = self.w.cfg.dispatcher, self.w
         return (convo is not None and convo.day == w.today() and convo.specs == specs
-                and w.now() - convo.ended_at <= timedelta(minutes=a.continue_minutes)
-                and convo.chars() < a.continue_max_chars)
+                and w.now() - convo.ended_at <= timedelta(minutes=d.continue_minutes)
+                and convo.chars() < d.continue_max_chars)
 
     def start(self) -> None:
-        for i in range(self.w.cfg.llm.concurrency):
-            threading.Thread(target=self._loop, name=f"agent-{i}", daemon=True).start()
+        self.threaded = True
 
-    def submit(self, turn: Turn) -> None:
-        self.turns.put((0 if turn.human else 1, next(self.seq), turn))
+    def submit(self, job: Turn | SessionJob) -> None:
+        if not self.threaded:
+            self.queued.append(job)
+            return
+        target = self._turn if isinstance(job, Turn) else self._session
+        name = f"turn-{job.agent}" if isinstance(job, Turn) else f"session-{job.task}"
+        threading.Thread(target=target, args=(job,), name=name, daemon=True).start()
 
     def _set_down(self, down: bool, why: str = "") -> None:
         with self._down_lock:
             if self.down == down:
                 return
             self.down = down
-        self.inbox.put(Notice(f":warning: Inference server unreachable ({why}). Agents wait for it."
-                              if down else ":check: Inference server is back."))
+        self.w.inbox.put(Notice(f":warning: Inference server unreachable ({why}). Agents wait for it."
+                                if down else ":check: Inference server is back."))
 
-    def _wait_healthy(self) -> None:
+    def _wait_healthy(self, llm) -> None:
         delay = 15
-        while not self.llm.healthy():
+        while not llm.healthy():
             self._set_down(True, "health check failed")
             time.sleep(delay)
             delay = min(delay * 2, 300)
         self._set_down(False)
 
-    def _loop(self) -> None:
-        while True:
-            _, _, turn = self.turns.get()
-            while self.w.halted.is_set():
-                time.sleep(5)
-            steps, outcome = 0, "error"
-            try:
-                steps, outcome = self.run_turn(turn)
-            except Exception as e:  # noqa: BLE001 - reported to #ops
-                log.exception("turn of %s", turn.agent)
-                self.inbox.put(Notice(f":warning: {turn.agent}'s turn failed: `{type(e).__name__}: {e}`"))
-            finally:
-                self.inbox.put(TurnDone(turn.agent, steps, outcome))
+    def _turn(self, turn: Turn) -> None:
+        while self.w.halted.is_set():
+            time.sleep(5)
+        steps, outcome = 0, "error"
+        try:
+            steps, outcome = self.run_turn(turn)
+        except Exception as e:  # noqa: BLE001 - reported to #ops
+            log.exception("turn of %s", turn.agent)
+            self.w.inbox.put(Notice(f":warning: {turn.agent}'s turn failed: `{type(e).__name__}: {e}`"))
+        finally:
+            self.w.inbox.put(TurnDone(turn.agent, steps, outcome))
+
+    def _session(self, job: SessionJob) -> None:
+        outcome = "error"
+        try:
+            outcome = self.sessions.run(job)
+        except Exception as e:  # noqa: BLE001 - reported to #ops
+            log.exception("session on #%d", job.task)
+            self.w.inbox.put(Notice(f":warning: {job.account}'s session on #{job.task} failed: "
+                                    f"`{type(e).__name__}: {e}`"))
+        finally:
+            self.w.inbox.put(SessionDone(job.account, job.task, outcome))
 
     def run_turn(self, turn: Turn) -> tuple[int, str]:
-        w, persona = self.w, self.w.cfg.personas[turn.agent]
+        w = self.w
+        engine: TurnEngine = w.cfg.accounts[turn.agent].engine
+        llm = self.llms[engine.model]
         with w.lock:
             fresh, specs, _ = request(w, turn)
             msgs = team_messages(w)
@@ -377,12 +478,12 @@ class Runner:
                 messages, mode = fresh, "fresh"
             started = w.now()
         steps, reply = 0, None
-        while steps < w.cfg.agents.max_steps:
+        while steps < w.cfg.dispatcher.max_steps:
             if w.halted.is_set():
                 return steps, "halted"
-            self._wait_healthy()
+            self._wait_healthy(llm)
             try:
-                reply = self.llm.chat(persona, messages, specs)
+                reply = llm.chat(turn.agent, engine, messages, specs)
             except LLMDown as e:
                 self._set_down(True, str(e)[:100])
                 continue
@@ -401,17 +502,18 @@ class Runner:
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
         else:
             return steps, "out of steps"
-        # A human asked something and the agent answered in plain text
-        # instead of with send_message: deliver the text where they asked.
+        # A person asked something and the account answered in plain text
+        # instead of with comment: deliver the text where they asked.
         asked = [t for t in turn.triggers if t.kind == "human"]
         if reply and reply["content"] and asked and not turn.spoke:
             t = asked[-1]
             with w.lock:
-                tools.execute(w, turn, "send_message", json.dumps({"stream": t.stream, "topic": t.topic, "content": reply["content"]}))
+                tools.execute(w, turn, "comment", json.dumps({"ref": f"zulip:{t.stream}/{t.topic}",
+                                                              "text": reply["content"]}))
         # Only a turn that ran to its end records anything: after a timeout or
         # a halt, the next heartbeat must not be skipped as "seen". What it
-        # records is what a heartbeat would see now, after the agent's own
-        # actions (its notes, messages, drafts): otherwise every turn that did
+        # records is what a heartbeat would see now, after the account's own
+        # actions (its notes, messages, tasks): otherwise every turn that did
         # anything would make the next heartbeat look new.
         with w.lock:
             w.store.put(fingerprint_key(turn.agent), request(w, Turn(turn.agent, [Trigger("heartbeat")]))[2])

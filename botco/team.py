@@ -28,22 +28,33 @@ class Blocked(Exception):
 
 
 class Team:
+    """Bots are accounts with a zuliprc; people are accounts with a Zulip
+    email. Anyone else in the realm can chat but holds no role."""
+
     def __init__(self, cfg: Config, breakers: Breakers):
         self.cfg = cfg
         self.breakers = breakers
         self.bots: dict[str, Bot] = {}
-        for name, persona in cfg.personas.items():
-            client = zulip.Client(config_file=str(persona.zuliprc), client="botco")
+        for name, account in cfg.accounts.items():
+            if not account.zuliprc:
+                continue
+            client = zulip.Client(config_file=str(account.zuliprc), client="botco")
             me = client.get_profile()
             if me.get("result") != "success":
                 raise RuntimeError(f"{name}: cannot log in to Zulip: {me.get('msg')}")
             self.bots[name] = Bot(name, client, me["user_id"], me["full_name"])
         self.bot_ids = {b.user_id for b in self.bots.values()}
         self._is_bot: dict[int, bool] = {}
-        # The CEO is the realm owner (role 100), or else the first human.
-        humans = [m for m in self.ops.get_members()["members"] if not m["is_bot"] and m.get("is_active", True)]
-        owners = [m for m in humans if m.get("role") == 100] or humans
-        self.ceo = owners[0]["full_name"] if owners else "CEO"
+        # People: account name -> (user id, full name).
+        self.people: dict[str, tuple[int, str]] = {}
+        members = {m["email"].lower(): m for m in self.ops.get_members()["members"]}
+        for name, account in cfg.accounts.items():
+            if account.zulip:
+                m = members.get(account.zulip.lower())
+                if m is None:
+                    log.warning("account %s: no Zulip user %s", name, account.zulip)
+                else:
+                    self.people[name] = (m["user_id"], m["full_name"])
 
     @property
     def ops(self) -> zulip.Client:
@@ -51,16 +62,23 @@ class Team:
 
     def names(self) -> dict[str, int]:
         """Zulip full name -> user id, for mention parsing."""
-        return {b.full_name: b.user_id for b in self.bots.values()}
+        return {b.full_name: b.user_id for b in self.bots.values()} | {n: uid for uid, n in self.people.values()}
 
-    def persona_of(self, full_name_or_id: str | int) -> str | None:
+    def account_of(self, full_name_or_id: str | int) -> str | None:
         for b in self.bots.values():
             if full_name_or_id in (b.full_name, b.user_id):
                 return b.persona
+        for name, (uid, full) in self.people.items():
+            if full_name_or_id in (full, uid):
+                return name
         return None
 
-    def mention(self, persona: str) -> str:
-        return f"@**{self.bots[persona].full_name}**"
+    def mention(self, account: str) -> str:
+        if account in self.bots:
+            return f"@**{self.bots[account].full_name}**"
+        if account in self.people:
+            return f"@**{self.people[account][1]}**"
+        return account
 
     def is_bot(self, user_id: int) -> bool:
         """Any bot account counts, not only ours."""
@@ -73,7 +91,7 @@ class Team:
 
     def setup_streams(self) -> None:
         """Create the streams if needed and subscribe every bot and human."""
-        subs = [{"name": s} for s in self.cfg.streams.all()]
+        subs = [{"name": s} for s in self.cfg.all_streams()]
         for bot in self.bots.values():
             r = bot.client.add_subscriptions(streams=subs)
             if r.get("result") != "success":
@@ -85,7 +103,8 @@ class Team:
             log.warning("could not subscribe humans: %s", r.get("msg"))
 
     def send(self, persona: str, stream: str, topic: str, content: str, check: bool = True) -> int:
-        """Post as `persona`. Raises Blocked if a breaker trips."""
+        """Post as `persona`, a bot account. Raises Blocked if a breaker
+        trips."""
         if check:
             why = self.breakers.allow(persona, stream, topic)
             if why:
@@ -125,7 +144,7 @@ class Team:
         """Push every message and reaction event into `inbox`, from a thread,
         on a client of its own. The zulip library re-registers the queue
         after errors by itself."""
-        client = zulip.Client(config_file=str(self.cfg.personas[self.cfg.publisher].zuliprc), client="botco-events")
+        client = zulip.Client(config_file=str(self.cfg.accounts[self.cfg.publisher].zuliprc), client="botco-events")
 
         def run() -> None:
             client.call_on_each_event(inbox.put, event_types=["message", "reaction"], apply_markdown=False)

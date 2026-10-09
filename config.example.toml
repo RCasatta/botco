@@ -3,70 +3,151 @@
 state_dir = "state"
 timezone = "Europe/Rome"
 # reference_file = "reference.md"   # example posts to learn tone from
+# The bot that posts operational messages and records; no model.
+publisher = "publisher"
 
-[llm]
-base_url = "http://100.110.202.124:8080/v1"
+# Model servers, named so accounts can pick one.
+[models.local]
+url = "http://100.110.202.124:8080/v1"   # TabbyAPI, 27B
+id = "Qwen3.8-27B-exl3-SC-4bpw"          # pi needs it for sessions
 timeout = 1800
-concurrency = 1
+slots = 2           # requests at once: turns may use both...
+session_slots = 1   # ...sessions only one, so chat never waits behind them
 
-[streams]
-plan = "plan"
-drafts = "drafts"
-published = "published"
-metrics = "metrics"
-ops = "ops"
+# Accounts: people or models. The code never checks which; roles decide what
+# an account may do, and the engine how a model works.
 
-[agents]
-coordinator = "strategist"
+[accounts.riccardo]          # no engine: a person
+roles = ["owner"]
+zulip = "riccardo@example.com"
+github = "RCasatta"
+
+[accounts.strategist]
+roles = ["strategist", "writer"]
+zuliprc = "strategist-zuliprc"
+engine = { kind = "turn", persona = "strategist", model = "local", max_tokens = 16000 }
+
+[accounts.writer]
+roles = ["writer"]
+zuliprc = "writer-zuliprc"
+# Every turn account uses the same thinking setting: the chat template starts
+# the prompt with it, so a different one would cost the shared cache prefix.
+engine = { kind = "turn", persona = "writer", model = "local", temperature = 0.9 }
+
+[accounts.editor]
+roles = ["editor"]
+zuliprc = "editor-zuliprc"
+engine = { kind = "turn", persona = "editor", model = "local", temperature = 0.6 }
+
+# [accounts.dev]
+# roles = ["dev"]
+# engine = { kind = "session", cmd = "pi", model = "local", persona = "dev",
+#            workspace = "/var/lib/botco/work/{task}",
+#            ro = ["/srv/repos/bot-company"], max_minutes = 60,
+#            network = true, gpu = false }
+
+# No model: publishes approved posts and records metrics.
+[accounts.publisher]
+roles = []
+zuliprc = "publisher-zuliprc"
+
+# Roles. `includes` grants another role's permissions too; `unaddressed`
+# routes a message from this role that mentions nobody; `priority` orders the
+# turns this role's requests wake (lower first); `turns_per_day` is the budget
+# of accounts with this role.
+[roles.owner]
+includes = ["editor", "strategist", "writer"]
+unaddressed = "strategist"
+priority = 0
+
+[roles.strategist]
+turns_per_day = 150
+
+[roles.writer]
+turns_per_day = 100
+
+[roles.editor]
+turns_per_day = 100
+
+[roles.dev]
+turns_per_day = 10
+
+# Kinds: a label plus its policy. create/edit/close list the roles that may
+# (absent: anyone; author and assignee may always edit and close their task);
+# approve lists the roles that must each approve the current body.
+[kinds.post]
+stream = "drafts"
+create = ["writer", "strategist"]
+edit = ["writer", "strategist"]
+validate = "x_post"            # 280 chars, no links...
+approve = ["editor", "owner"]  # one from each role
+max_revisions = 3              # then waits on the owner
+sink = "x"
+
+[kinds.plan]
+stream = "plan"
+create = ["strategist"]
+edit = ["strategist"]
+one_open = true                # a new plan closes the old one
+
+[kinds.task]                   # the default kind: waits on the assignee
+stream = "tasks"               # until they close it
+create = ["strategist", "owner"]
+
+[schedules.weekly-plan]
+cron = "0 8 * * MON"
+kind = "plan"
+assignee = "strategist"
+title = "Plan for week {iso_week}"
+body = "Review last week's posts and set three goals."
+
+[dispatcher]
 heartbeat_minutes = 60
 active_from = "07:30"
 active_to = "23:00"
 max_steps = 10
-max_turns_per_day = 300
+turns_per_day = 300            # for accounts no role gives a budget
 activity_log = true
 continue_minutes = 15
 continue_max_chars = 200000
+max_depth = 1                  # agents' tasks cannot create more tasks
+max_new_tasks_per_day = 10     # per account
+max_open_per_assignee = 20
 
-[publishing]
+[sinks.x]
+account = "publisher"
 times = ["10:00", "14:00", "19:00"]
 min_gap_minutes = 60
-ceo_approval = true
 max_chars = 280
 metrics_time = "23:30"
+dry_run = true
+env_file = "x.env"
+
+[streams]
+published = "published"
+metrics = "metrics"
+ops = "ops"
 
 [breakers]
 bot_messages_per_hour = 40
 bot_streak_per_topic = 20
 
-# The lab notebook: markdown reports of the inference experiments, read by
-# the agents through tools. On ripper the service sees it at /run/botco-lab.
-[lab]
+# Read-only sources.
+[sources]
+poll_minutes = 15              # referenced external issues
+
+# The lab notebook: markdown reports of the inference experiments. On ripper
+# the service sees it at /run/botco-lab.
+[sources.lab]
 dir = "/run/botco-lab"
 exclude = ["CLAUDE.md", "models", "llama.cpp", "Strata", "src", ".git"]
+notify = "strategist"
 
-[x]
-dry_run = true
-env_file = "x.env"
+# [sources.github]
+# repos = ["RCasatta/foo"]     # searched by find; any issue can be read by ref
+# token_env = "GITHUB_TOKEN"   # a read token; public repos need none
 
-[personas.strategist]
-zuliprc = "strategist-zuliprc"
-thinking = true
-max_tokens = 16000
-
-# Every agent uses the same thinking setting: the chat template starts the
-# prompt with it, so a different one would cost the shared cache prefix.
-[personas.writer]
-zuliprc = "writer-zuliprc"
-thinking = true
-max_tokens = 8000
-temperature = 0.9
-
-[personas.editor]
-zuliprc = "editor-zuliprc"
-thinking = true
-max_tokens = 8000
-temperature = 0.6
-
-# No LLM: publishes approved drafts and records metrics.
-[personas.publisher]
-zuliprc = "publisher-zuliprc"
+# [sources.gitlab]
+# url = "https://gitlab.com"
+# projects = ["group/proj"]
+# token_env = "GITLAB_TOKEN"

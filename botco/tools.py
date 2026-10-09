@@ -1,7 +1,10 @@
-"""The tools agents act through, as OpenAI function-calling specs plus their
-implementations. Tools are where the hard rules live: a model can call any
-tool it is offered, so each implementation checks what must hold whatever the
-model thinks (X's post rules, who may review, that the CEO really spoke)."""
+"""The five tools turn accounts act through, addressed by refs, as
+OpenAI function-calling specs plus their implementations.
+
+Every account is offered the same five tools, so the beginning of every
+request stays identical and the server can reuse its cache; what an
+account may actually do is decided by the tracker's policy when a tool
+runs, and a refusal goes back to the model with its reason."""
 
 from __future__ import annotations
 
@@ -9,11 +12,14 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Callable
 
-from . import text as T
-from .store import Draft
+from .external import ExternalError, summary
+from .policy import Ref, parse_ref
+from .store import Task
 from .team import Blocked
+from .tracker import Refused, Tracker
 from .world import World, quote
 
 log = logging.getLogger(__name__)
@@ -21,21 +27,25 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Trigger:
-    """Why an agent got a turn."""
+    """Why an account got a turn."""
 
-    kind: str  # human, bot or heartbeat
+    kind: str  # human, bot, heartbeat, lab or task
     sender: str = ""
     stream: str = ""
     topic: str = ""
     content: str = ""
     msg_id: int = 0
+    # The sender's account, if it has one.
+    account: str | None = None
+    # The task that changed, for task triggers.
+    task: int = 0
 
 
 @dataclass
 class Turn:
     agent: str
     triggers: list[Trigger]
-    # Whether the agent said anything in Zulip during this turn.
+    # Whether the account said anything in Zulip during this turn.
     spoke: bool = False
 
     @property
@@ -53,9 +63,6 @@ class Tool:
     description: str
     params: dict
     run: Callable[[World, Turn, dict], str]
-    agents: tuple[str, ...] = ()  # empty: everyone
-    human_turn_only: bool = False
-    needs_lab: bool = False
     required: list[str] = field(default_factory=list)
 
     def spec(self) -> dict:
@@ -69,133 +76,241 @@ class Tool:
         }
 
 
-def _open_draft(w: World, draft_id) -> Draft:
-    d = w.store.draft(int(draft_id))
-    if d is None:
-        raise ToolError(f"there is no draft #{draft_id}")
-    if d.status != "draft":
-        raise ToolError(f"draft #{d.id} is {d.status}, not open")
-    return d
-
-
 def fix_mentions(w: World, content: str) -> str:
-    """Models often write @writer or @ceo; Zulip only notifies on @**writer**
-    and @**<the CEO's name>**."""
+    """Models often write @writer or @owner; Zulip only notifies on
+    @**writer** and @**<the person's full name>**."""
     names = "|".join(re.escape(n) for n in w.team.names())
-    content = re.sub(rf"(?<![\w*])@({names})\b(?!\*)", r"@**\1**", content, flags=re.IGNORECASE)
-    return re.sub(r"(?<![\w*])@(\*\*)?ceo\b(\*\*)?", f"@**{w.team.ceo}**", content, flags=re.IGNORECASE)
+    if names:
+        content = re.sub(rf"(?<![\w*])@({names})\b(?!\*)", r"@**\1**", content, flags=re.IGNORECASE)
+    for account in w.cfg.accounts:
+        mention = w.team.mention(account)
+        if mention not in (account, f"@**{account}**"):
+            content = re.sub(rf"(?<![\w*])@(\*\*)?{re.escape(account)}\b(\*\*)?", mention, content, flags=re.IGNORECASE)
+    owners = [a for a in w.policy.holders("owner")] if "owner" in w.cfg.roles else []
+    if owners:
+        content = re.sub(r"(?<![\w*])@(\*\*)?ceo\b(\*\*)?", w.team.mention(owners[0]), content, flags=re.IGNORECASE)
+    return content
 
 
-def send_message(w: World, turn: Turn, a: dict) -> str:
-    stream, topic, content = a["stream"].lstrip("#"), a["topic"], fix_mentions(w, a["content"].strip())
-    if not content:
-        raise ToolError("empty message")
+def _ref(a: dict, key: str = "ref") -> Ref:
     try:
-        msg_id = w.team.send(turn.agent, stream, topic, content)
-    except Blocked as e:
-        raise ToolError(f"not sent, a circuit breaker stopped it: {e}")
-    turn.spoke = True
-    return f"sent to #{stream} > {topic} (message {msg_id})"
+        return parse_ref(str(a[key]))
+    except ValueError as e:
+        raise ToolError(str(e)) from None
 
 
-def create_draft(w: World, turn: Turn, a: dict) -> str:
-    post = T.clean_post(a["text"])
-    problems = w.check(post)
-    if problems:
-        raise ToolError("not saved, the post breaks the rules: " + "; ".join(problems))
-    note = fix_mentions(w, a.get("note", "").strip())
-    draft_id = w.store.add_draft(w.today(), post, turn.agent, note)
-    d = w.store.draft(draft_id)
-    msg = f"New draft **#{d.id}** by {turn.agent}, {T.x_length(post)} characters:\n{quote(post)}"
-    w.post_about(turn.agent, d, msg + (f"\n{note}" if note else ""), check=False)
-    turn.spoke = True
-    return f"saved as draft #{d.id} and posted in #{w.cfg.streams.drafts} > {d.topic}"
-
-
-def revise_draft(w: World, turn: Turn, a: dict) -> str:
-    d = _open_draft(w, a["draft_id"])
-    post = T.clean_post(a["text"])
-    if post == d.text:
-        raise ToolError(f"the text is identical to draft #{d.id}'s current version; nothing to revise")
-    problems = w.check(post, exclude=d.id)
-    if problems:
-        raise ToolError("not saved, the post breaks the rules: " + "; ".join(problems))
-    n = d.revisions + 1
-    note = fix_mentions(w, a.get("note", "").strip())
-    w.store.update_draft(d.id, text=post, revisions=n, editor_ok=0, ceo_ok=0, note=note or d.note)
-    msg = f"Revision {n} of **#{d.id}** by {turn.agent}, {T.x_length(post)} characters:\n{quote(post)}"
-    w.post_about(turn.agent, d, msg + (f"\n{note}" if note else ""), check=False)
-    turn.spoke = True
-    return f"draft #{d.id} updated; it needs a new review from the editor"
-
-
-def review_draft(w: World, turn: Turn, a: dict) -> str:
-    d = _open_draft(w, a["draft_id"])
-    verdict, comments = a["verdict"], fix_mentions(w, a.get("comments", "").strip())
-    if verdict == "approve":
-        w.store.update_draft(d.id, editor_ok=1, feedback=comments)
-        waits = " It now waits for the CEO's approval." if w.cfg.publishing.ceo_approval and not d.ceo_ok else ""
-        result = f"draft #{d.id} approved by the editor.{waits}"
-    elif verdict == "revise":
-        w.store.update_draft(d.id, editor_ok=0, feedback=comments)
-        result = f"draft #{d.id} sent back for revision"
-    elif verdict == "reject":
-        w.store.update_draft(d.id, status="rejected", feedback=comments)
-        result = f"draft #{d.id} rejected"
+def _task(w: World, ref: Ref) -> Task:
+    """The local task a ref names: #42, or the Zulip topic of a task."""
+    if ref.kind == "zulip":
+        t = w.store.task_by_topic(ref.stream, ref.topic)
+    elif ref.kind == "task":
+        t = w.store.task(ref.task)
     else:
-        raise ToolError("verdict must be approve, revise or reject")
-    w.post_about(turn.agent, d, f"Review of **#{d.id}**: **{verdict}**\n{comments}", check=False)
-    turn.spoke = True
-    return result
+        t = None
+    if t is None:
+        raise ToolError(f"there is no task {ref.text}")
+    return t
 
 
-def ceo_decision(w: World, turn: Turn, a: dict) -> str:
-    d = _open_draft(w, a["draft_id"])
-    words = a.get("ceo_words", "").strip()
-    if a["decision"] == "approve":
-        # The CEO outranks the editor.
-        w.store.update_draft(d.id, ceo_ok=1, editor_ok=1)
-        what, result = "approved", f"draft #{d.id} approved; the publisher will post it at the next free slot"
-    elif a["decision"] == "reject":
-        w.store.update_draft(d.id, status="rejected")
-        what, result = "rejected", f"draft #{d.id} rejected"
-    else:
-        raise ToolError("decision must be approve or reject")
-    # Echoed by the publisher, not the agent: this is the record of what the
-    # model understood, for the CEO to catch a misunderstanding.
-    said = f"\n> {words}" if words else ""
-    w.post_about(w.cfg.publisher, d, f"Recorded: the CEO **{what}** draft #{d.id} "
-                 f"(understood by {turn.agent} from:{said or ' a message'})", check=False)
-    return result
+def _list(v) -> list[str] | None:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return [s.strip() for s in v.split(",") if s.strip()]
+    return [str(s) for s in v]
 
 
-def update_plan(w: World, turn: Turn, a: dict) -> str:
-    plan = a["text"].strip()
-    if not plan:
-        raise ToolError("empty plan")
-    week = w.week()
-    w.store.add_plan(week, plan)
-    w.team.send(turn.agent, w.cfg.streams.plan, f"plan {week}", plan, check=False)
-    turn.spoke = True
-    return f"plan for {week} saved and posted in #{w.cfg.streams.plan}"
+def creation_depth(w: World, turn: Turn, refs: list[str]) -> tuple[int, int | None]:
+    """Depth 0 for work a person asked for or an external issue calls for;
+    one more than the task being handled otherwise."""
+    if any(parse_ref(r).external for r in refs) or turn.human:
+        return 0, None
+    handling = [w.store.task(t.task) for t in turn.triggers if t.kind == "task" and t.task]
+    handling = [t for t in handling if t is not None]
+    if handling:
+        parent = max(handling, key=lambda t: t.depth)
+        return parent.depth + 1, parent.id
+    return 1, None
 
 
-def read_topic(w: World, turn: Turn, a: dict) -> str:
-    msgs = w.team.history(a["stream"].lstrip("#"), a["topic"], n=30)
+def external(w: World, ref: Ref) -> str:
+    """An external issue, from the cache when it is fresh."""
+    cached = w.store.external(ref.text)
+    fresh = cached and cached.fetched_at and \
+        w.now() - datetime.fromisoformat(cached.fetched_at) < timedelta(minutes=w.cfg.sources.poll_minutes)
+    if not fresh:
+        try:
+            got = w.issues.fetch(ref)
+            w.store.put_external(got)
+            cached = w.store.external(ref.text)
+        except ExternalError as e:
+            if not cached:
+                raise ToolError(f"cannot read {ref.text}: {e}") from None
+    return summary(cached, 6000)
+
+
+# the tools
+
+def find(w: World, turn: Turn, a: dict) -> str:
+    query = a["query"].strip()
+    words = query.split()
+    if not words:
+        raise ToolError("empty query")
+    out = []
+    tasks = w.store.search(words, 15)
+    if tasks:
+        out.append("Tasks:\n" + "\n".join(f"- #{t.id} [{t.status if t.open else t.resolution}] {t.kind} by "
+                                           f"{t.author}: {t.title}" for t in tasks))
+    if w.lab and w.lab.available():
+        hits = w.lab.search(query, limit=15)
+        if hits not in ("no matches", "empty query"):
+            out.append("Lab notebook:\n" + "\n".join(f"- lab:{h}" for h in hits.splitlines()))
+    issues = w.issues.search(query)
+    if issues:
+        out.append("External issues:\n" + "\n".join(f"- {r} [{s}] {t}" if r else f"- {t}" for r, s, t in issues))
+    return "\n\n".join(out) or "nothing found"
+
+
+def read(w: World, turn: Turn, a: dict) -> str:
+    ref = _ref(a)
+    if ref.kind == "task":
+        from .agents import task_block  # agents imports tools
+        t = _task(w, ref)
+        lines = [task_block(w, t).replace("### ", "", 1)]
+        if not t.open:
+            lines.insert(1, f"Closed: {t.resolution} ({(t.closed_at or '')[:16]})" + (f", X id {t.x_id}" if t.x_id else ""))
+        if t.version > 1:
+            lines.append(f"{t.version} versions; earlier reviews: {len(w.store.reviews(t.id))} in all")
+        comments = w.store.comments(t.id, 20)
+        if len(comments) > 5:
+            lines.append("All recent comments:\n" + "\n".join(f"- {c.author} ({c.at[:16]}): {c.text[:1500]}"
+                                                               for c in comments))
+        for r in t.refs:
+            other = parse_ref(r)
+            if other.external:
+                try:
+                    lines.append("Referenced: " + external(w, other))
+                except ToolError as e:
+                    lines.append(f"Referenced {r}: {e}")
+        lines.append(f"Topic: zulip:{t.stream}/{t.topic}")
+        return "\n\n".join(lines)
+    if ref.external:
+        text = external(w, ref)
+        local = next((t for t in w.store.open_tasks() if ref.text in t.refs), None)
+        return text + (f"\n\nLocal task: #{local.id}" if local else "\n\nNo open local task refers to it.")
+    if ref.kind == "lab":
+        if w.lab is None:
+            raise ToolError("there is no lab notebook")
+        section, part = ref.section, 1
+        if section.isdigit():
+            section, part = "", int(section)
+        try:
+            return w.lab.read(ref.path, section, part)
+        except FileNotFoundError as e:
+            raise ToolError(str(e)) from None
+    msgs = w.team.history(ref.stream, ref.topic, n=30)
+    task = w.store.task_by_topic(ref.stream, ref.topic)
+    head = f"This is the topic of #{task.id}.\n" if task else ""
     if not msgs:
-        return "no messages there"
-    return "\n".join(f"{m['sender_full_name']}: {m['content'][:1500]}" for m in msgs)
+        return head + "no messages there"
+    return head + "\n".join(f"{m['sender_full_name']}: {m['content'][:1500]}" for m in msgs)
 
 
-def read_lab_note(w: World, turn: Turn, a: dict) -> str:
+def write(w: World, turn: Turn, a: dict) -> str:
+    tracker = Tracker(w)
+    fields = dict(title=a.get("title"), body=a.get("body"), note=fix_mentions(w, a["note"]) if a.get("note") else None,
+                  labels=_list(a.get("labels")), assignee=a.get("assignee"), refs=_list(a.get("refs")))
+    state = a.get("state")
+    if not a.get("ref"):
+        if state not in (None, "", "open"):
+            raise ToolError("a new task is open; leave out state")
+        refs = fields["refs"] or []
+        try:
+            depth, parent = creation_depth(w, turn, refs)
+        except ValueError as e:
+            raise ToolError(str(e)) from None
+        t, new = tracker.create(turn.agent, a.get("kind") or "task", fields["title"] or "", fields["body"] or "",
+                                fields["note"] or "", fields["labels"], fields["assignee"], refs, depth, parent)
+        if not new:
+            return f"not created: #{t.id} is already the open task for {t.external_id}; work there"
+        turn.spoke = True
+        waiting = w.policy.waits_on(w.store, t)
+        return (f"created #{t.id} in zulip:{t.stream}/{t.topic}; it waits on "
+                f"{', '.join(waiting.accounts) or 'nobody'} ({waiting.why})")
+    ref = _ref(a)
+    if ref.external or ref.kind == "lab":
+        raise ToolError(f"{ref.text} is read-only")
+    t = _task(w, ref)
+    if a.get("kind") and a["kind"] != t.kind:
+        raise ToolError("the kind of a task cannot change")
+    done = []
+    if state == "open" and not t.open:
+        tracker.reopen(turn.agent, t)
+        t, done = w.store.task(t.id), ["reopened"]
+    if any(v is not None for v in fields.values()):
+        done += tracker.edit(turn.agent, t, **fields)
+        t = w.store.task(t.id)
+        turn.spoke = True
+    if state not in (None, "", "open"):
+        tracker.close(turn.agent, t, state)
+        done.append(f"closed as {state}")
+        turn.spoke = True
+    if not done:
+        raise ToolError("nothing to change: give a field to set or a state")
+    t = w.store.task(t.id)
+    waiting = w.policy.waits_on(w.store, t)
+    return f"#{t.id}: {'; '.join(done)}. It waits on {', '.join(waiting.accounts) or 'nobody'} ({waiting.why})"
+
+
+def comment(w: World, turn: Turn, a: dict) -> str:
+    ref = _ref(a)
+    text = fix_mentions(w, (a.get("text") or "").strip())
+    verdict, behalf = a.get("verdict") or None, a.get("on_behalf_of")
+    if ref.external or ref.kind == "lab":
+        raise ToolError(f"{ref.text} is read-only")
+    tracker = Tracker(w)
+    if ref.kind == "zulip" and w.store.task_by_topic(ref.stream, ref.topic) is None:
+        if verdict:
+            raise ToolError("a verdict is about a task: comment on its ref")
+        if not text:
+            raise ToolError("empty message")
+        try:
+            msg_id = w.team.send(turn.agent, ref.stream, ref.topic, text)
+        except Blocked as e:
+            raise ToolError(f"not sent, a circuit breaker stopped it: {e}") from None
+        turn.spoke = True
+        return f"sent to #{ref.stream} > {ref.topic} (message {msg_id})"
+    t = _task(w, ref)
     try:
-        return w.lab.read(a["path"], a.get("section", ""), int(a.get("part", 1)))
-    except FileNotFoundError as e:
-        raise ToolError(str(e))
-
-
-def search_lab_notes(w: World, turn: Turn, a: dict) -> str:
-    return w.lab.search(a["query"])
+        if not verdict:
+            if behalf:
+                raise ToolError("on_behalf_of only goes with a verdict")
+            tracker.comment(turn.agent, t, text)
+            turn.spoke = True
+            return f"commented on #{t.id}"
+        if not behalf:
+            result = tracker.review(turn.agent, t, verdict, text)
+            turn.spoke = True
+            return result
+        # A person's verdict, stated in words: only from a message that woke
+        # this turn, recorded under its author with their roles.
+        said = next((tr for tr in turn.triggers if tr.kind == "human" and tr.msg_id == int(behalf)), None)
+        if said is None:
+            woke = [str(tr.msg_id) for tr in turn.triggers if tr.kind == "human"]
+            raise ToolError("on_behalf_of must be the id of a person's message that woke you"
+                            + (f": {', '.join(woke)}" if woke else "; no person's message woke you"))
+        if not said.account:
+            raise ToolError(f"{said.sender} has no account here, so their verdict counts for nothing")
+        result = tracker.review(said.account, t, verdict, text, recorded_by=turn.agent, msg_id=said.msg_id, post=False)
+        # Echoed by the publisher, not the agent: this is the record of what
+        # the model understood, for the person to catch a misunderstanding.
+        words = said.content.strip()[:300]
+        tracker.post(w.cfg.publisher, t, f"Recorded: {said.account} **{verdict}** #{t.id} (understood by "
+                     f"{turn.agent} from:\n{quote(words)})" + (f"\n{text}" if text else ""))
+        turn.spoke = True
+        return result
+    except Blocked as e:
+        raise ToolError(f"not sent, a circuit breaker stopped it: {e}") from None
 
 
 def remember(w: World, turn: Turn, a: dict) -> str:
@@ -208,45 +323,35 @@ def remember(w: World, turn: Turn, a: dict) -> str:
 
 S = {"type": "string"}
 I = {"type": "integer"}
+LIST = {"type": "array", "items": S}
+
+REFS = ("Refs: #42 (a task), gh:owner/repo#12 and gl:group/proj#7 (external issues, read-only), "
+        "lab:FILE.md#Section (lab notebook, read-only), zulip:stream/topic (a chat topic).")
 
 TOOLS = [
-    Tool("send_message",
-         "Post a message in a Zulip stream and topic. Mention a teammate as @**name** to wake them up.",
-         {"stream": S, "topic": S, "content": S}, send_message, required=["stream", "topic", "content"]),
-    Tool("create_draft",
-         "Writer and strategist. Save a new X post draft and show it in #drafts. The text must be the exact post. "
-         "Use the note to tell the team something about it, e.g. ask @**editor** for a review.",
-         {"text": S, "note": S}, create_draft, agents=("writer", "strategist"), required=["text"]),
-    Tool("revise_draft",
-         "Writer and strategist. Replace the text of an open draft with a new version. "
-         "The editor must review it again.",
-         {"draft_id": I, "text": S, "note": S}, revise_draft, agents=("writer", "strategist"),
-         required=["draft_id", "text"]),
-    Tool("review_draft",
-         "Editor only. Give your verdict on an open draft: approve (publishable as is), revise (fixable, "
-         "say how in comments) or reject (not worth fixing). The review is posted in the draft's topic for you; "
-         "mention a teammate in the comments to wake them.",
-         {"draft_id": I, "verdict": {"type": "string", "enum": ["approve", "revise", "reject"]}, "comments": S},
-         review_draft, agents=("editor",), required=["draft_id", "verdict", "comments"]),
-    Tool("ceo_decision",
-         "Only in a turn started by the CEO's message. Record a decision the CEO clearly stated about a draft "
-         "in that message, e.g. 'post 5 is good' or 'drop 6'. Never use it on your own judgment. "
-         "Quote the CEO's words.",
-         {"draft_id": I, "decision": {"type": "string", "enum": ["approve", "reject"]}, "ceo_words": S},
-         ceo_decision, human_turn_only=True, required=["draft_id", "decision", "ceo_words"]),
-    Tool("update_plan",
-         "Strategist only. Replace this week's content plan with a new version and post it in #plan.",
-         {"text": S}, update_plan, agents=("strategist",), required=["text"]),
-    Tool("read_topic",
-         "Read the latest 30 messages of a Zulip topic.",
-         {"stream": S, "topic": S}, read_topic, required=["stream", "topic"]),
-    Tool("read_lab_note",
-         "Read a report from the lab notebook (our own inference experiments). Long reports come in parts; "
-         "pass a section name to read just that section.",
-         {"path": S, "section": S, "part": I}, read_lab_note, needs_lab=True, required=["path"]),
-    Tool("search_lab_notes",
-         "Find lines in the lab notebook that contain all the given words, e.g. 'decode 160K' or 'rejected SGLang'.",
-         {"query": S}, search_lab_notes, needs_lab=True, required=["query"]),
+    Tool("find",
+         "Search tasks, the lab notebook and external issues for all the given words, e.g. 'KV cache' or "
+         "'decode 160K'. Returns refs to read.",
+         {"query": S}, find, required=["query"]),
+    Tool("read",
+         "Read what a ref points to: a task with its reviews, comments, who it waits on and its referenced issues; "
+         "an external issue; a lab report or one section of it (lab:FILE.md#2 reads part 2 of a long one); the "
+         "latest 30 messages of a Zulip topic. " + REFS,
+         {"ref": S}, read, required=["ref"]),
+    Tool("write",
+         "Create a task (leave out ref) or change one (give its ref). kind is one of the kinds above, 'task' by "
+         "default. For a post, body is the exact text to publish. Editing the body of a task makes earlier "
+         "approvals stop counting. state 'done' or 'dropped' closes it, 'open' reopens it. note says something "
+         "about the change to the team (sources, intent). The tracker refuses what your role may not do.",
+         {"ref": S, "kind": S, "title": S, "body": S, "note": S, "labels": LIST, "assignee": S, "refs": LIST,
+          "state": {"type": "string", "enum": ["open", "done", "dropped"]}}, write),
+    Tool("comment",
+         "Comment on a task (shown in its topic) or post in a Zulip topic (zulip:stream/topic). Mention someone "
+         "as @**name** to call them. With a verdict (approve, revise, reject) on a task it is also your review; "
+         "the review is posted for you. When a person stated a verdict in words, record it with the verdict and "
+         "on_behalf_of set to the id of their message: it counts as theirs.",
+         {"ref": S, "text": S, "verdict": {"type": "string", "enum": ["approve", "revise", "reject"]},
+          "on_behalf_of": I}, comment, required=["ref", "text"]),
     Tool("remember",
          "Write a short note to yourself: a lesson, a commitment, something to follow up. "
          "You see your notes at the start of every turn.",
@@ -255,34 +360,11 @@ TOOLS = [
 BY_NAME = {t.name: t for t in TOOLS}
 
 
-def offered(lab: bool) -> list[Tool]:
-    """The tools in every request, the same for every agent and turn: the
-    chat template puts them before everything else, so one fixed list keeps
-    the prompt's beginning identical and lets the server reuse its cache.
-    Who may use what is checked when a tool runs."""
-    return [t for t in TOOLS if lab or not t.needs_lab]
-
-
-def refusal(tool: Tool, turn: Turn) -> str | None:
-    if tool.agents and turn.agent not in tool.agents:
-        return f"{tool.name} is for the {' and '.join(tool.agents)}; ask them by mentioning them"
-    if tool.human_turn_only and not turn.human:
-        return f"{tool.name} only works in a turn started by the CEO's message"
-    return None
-
-
-def available(agent: str, turn: Turn, lab: bool = False) -> list[Tool]:
-    """The tools this agent may actually use in this turn."""
-    return [t for t in offered(lab) if refusal(t, Turn(agent, turn.triggers)) is None]
-
-
 def execute(w: World, turn: Turn, name: str, arguments: str) -> str:
     """Run one tool call and return what the model sees as its result."""
     tool = BY_NAME.get(name)
-    if tool is None or tool not in offered(w.lab is not None):
+    if tool is None:
         result = f"error: there is no tool {name}"
-    elif why := refusal(tool, turn):
-        result = f"error: {why}"
     else:
         try:
             args = json.loads(arguments or "{}")
@@ -290,7 +372,7 @@ def execute(w: World, turn: Turn, name: str, arguments: str) -> str:
             if missing:
                 raise ToolError(f"missing arguments: {', '.join(missing)}")
             result = tool.run(w, turn, args)
-        except (ToolError, json.JSONDecodeError, ValueError, KeyError) as e:
+        except (ToolError, Refused, json.JSONDecodeError, ValueError, KeyError) as e:
             result = f"error: {e}"
         except Exception as e:  # noqa: BLE001 - the model sees it, the log keeps the trace
             log.exception("tool %s", name)

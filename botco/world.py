@@ -1,16 +1,19 @@
-"""What the main thread and the agent threads share: config, state, Zulip,
-X, and the lock that serializes access to them."""
+"""What the main thread and the worker threads share: config, policy, state,
+Zulip, X, the read-only sources, and the lock that serializes access to them."""
 
 from __future__ import annotations
 
+import queue
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from . import text as T
 from .config import Config
+from .external import Issues
 from .lab import Lab
-from .store import Draft, Store
+from .policy import Policy
+from .store import Store
 from .team import Team
 
 
@@ -18,14 +21,32 @@ def quote(s: str) -> str:
     return f"```quote\n{s}\n```"
 
 
+@dataclass
+class TaskChanged:
+    """A write to the tracker: the dispatcher wakes whoever the task waits
+    on, except the account that made the change."""
+
+    task: int
+    actor: str
+    what: str
+
+
 class World:
-    def __init__(self, cfg: Config, store: Store, team: Team, x):
+    def __init__(self, cfg: Config, store: Store, team: Team, x, inbox: queue.Queue | None = None,
+                 issues: Issues | None = None):
         self.cfg = cfg
         self.store = store
+        store.clock = self.now
         self.team = team
         self.x = x
-        self.lab = Lab(cfg.lab.dir, cfg.lab.exclude) if cfg.lab.dir else None
+        self.policy = Policy(cfg)
+        self.issues = issues if issues is not None else Issues(cfg.sources)
+        lab = cfg.sources.lab
+        self.lab = Lab(lab.dir, lab.exclude) if lab.dir else None
         self.tz = ZoneInfo(cfg.timezone)
+        # Events from the main thread and the workers: Zulip events, tracker
+        # changes, finished turns and sessions.
+        self.inbox: queue.Queue = inbox if inbox is not None else queue.Queue()
         # Held for every store or Zulip access; never while waiting for the
         # model.
         self.lock = threading.RLock()
@@ -40,24 +61,22 @@ class World:
     def week(self) -> str:
         return self.now().strftime("%G-W%V")
 
+    def midnight(self) -> str:
+        return self.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
+
     def activity(self, line: str) -> None:
-        if self.cfg.agents.activity_log:
+        if self.cfg.dispatcher.activity_log:
             self.team.notify(line, "activity")
 
-    def previous_posts(self, exclude: int | None = None) -> list[str]:
-        """Texts a new post must not repeat: published and open drafts."""
-        drafts = [d.text for d in self.store.open_drafts() if d.id != exclude]
-        return [d.text for d in self.store.published(50)] + drafts
-
-    def check(self, text: str, exclude: int | None = None) -> list[str]:
-        return T.check_post(text, self.cfg.publishing.max_chars, self.previous_posts(exclude))
-
-    def post_about(self, persona: str, d: Draft, content: str, check: bool = True) -> int:
-        """Post in the draft's own topic and remember that the message is about
-        it, so reactions and replies there can be traced back."""
-        msg_id = self.team.send(persona, self.cfg.streams.drafts, d.topic, content, check=check)
-        self.store.link_message(msg_id, d.id)
-        return msg_id
+    def changed(self, task: int, actor: str, what: str) -> None:
+        self.inbox.put(TaskChanged(task, actor, what))
 
     def published_on(self, day: str) -> int:
-        return sum(1 for d in self.store.published(50) if d.published_at and d.published_at.startswith(day))
+        return sum(1 for t in self.store.published(50) if t.closed_at and t.closed_at.startswith(day))
+
+    def voice(self, account: str) -> tuple[str, str]:
+        """The bot that posts for `account`, and a prefix naming the account
+        when that bot is not its own."""
+        if account in self.team.bots:
+            return account, ""
+        return self.cfg.publisher, f"**{account}**: "
