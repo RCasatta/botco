@@ -277,6 +277,7 @@ def test_owner_asks_in_words_and_the_team_delivers(env):
     pump(world, runner, company)
     assert waits(world, 1).ready
     assert world.team.reactions == [("publisher", 2, "check")]
+    assert world.team.sent("publisher", "drafts", "post #1")[-1]["content"] == "Recorded: riccardo **approve** #1."
 
     world.at = world.at.replace(hour=10, minute=1)
     company.tick()
@@ -810,3 +811,12 @@ def test_refused_is_raised_for_unknown_accounts(env):
     world, *_ = env
     with pytest.raises(Refused, match="no account"):
         Tracker(world).create("strategist", "task", "x", assignee="nobody")
+
+
+def test_the_coordinator_gets_the_first_heartbeat(tmp_path):
+    raw = raw_config(tmp_path)
+    raw["accounts"] = dict(sorted(raw["accounts"].items()))  # as Nix writes TOML: editor first
+    world = Clock(parse(raw, tmp_path), Store(tmp_path / "db.sqlite3"), FakeTeam(), DryRunX(), issues=FakeIssues())
+    company = Company(world, Runner(world, {"local": ScriptedLLM()}))
+    assert world.cfg.turn_accounts()[0] == "editor"
+    assert min(company.last_turn, key=company.last_turn.get) == "strategist", "people's messages go to it"

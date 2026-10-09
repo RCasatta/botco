@@ -81,10 +81,13 @@ class Company:
         self.running: dict[str, str] = {}
         self.running_sessions: dict[int, tuple[str, str]] = {}
         now = self.w.now()
-        # Stagger the first heartbeats over one interval.
+        # Stagger the first heartbeats over one interval: first the accounts
+        # people's messages go to, the coordinators, then the others.
+        routed = {r.unaddressed for r in self.cfg.roles.values()}
+        order = sorted(self.turn_accounts, key=lambda a: a not in routed)
         beat = timedelta(minutes=self.cfg.dispatcher.heartbeat_minutes)
-        n = max(len(self.turn_accounts), 1)
-        self.last_turn = {a: now - beat + i * beat / n for i, a in enumerate(self.turn_accounts)}
+        n = max(len(order), 1)
+        self.last_turn = {a: now - beat + i * beat / n for i, a in enumerate(order)}
         self.notified: set[str] = set()
         self.lab_checked = datetime.min.replace(tzinfo=self.w.tz)
 
@@ -411,8 +414,11 @@ class Company:
             reply(f"Not recorded: {e}.")
             return
         w.store.link_message(msg["id"], t.id)
-        if (stream, topic) != (t.stream, t.topic):
-            self.tracker.post(self.cfg.publisher, t, f"Recorded: {author} **{word}** #{t.id} (in #{stream} > {topic}).")
+        # In words too, not only as a reaction: the agents read the chat,
+        # not the reactions, and a refusal earlier in the topic would
+        # otherwise look like the last word.
+        where = "" if (stream, topic) == (t.stream, t.topic) else f" (in #{stream} > {topic})"
+        self.tracker.post(self.cfg.publisher, t, f"Recorded: {author} **{word}** #{t.id}{where}.")
         try:
             w.team.react(self.cfg.publisher, msg["id"], "check")
         except Exception:  # noqa: BLE001 - the review is recorded either way
