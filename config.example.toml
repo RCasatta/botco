@@ -44,7 +44,9 @@ engine = { kind = "turn", persona = "editor", model = "local", temperature = 0.6
 # engine = { kind = "session", cmd = "pi", model = "local", persona = "dev",
 #            workspace = "/var/lib/botco/work/{task}",
 #            ro = ["/srv/repos/bot-company"], max_minutes = 60,
-#            network = true, gpu = false }
+#            network = true, gpu = false,
+#            # credentials under a read-only path stay out of reach
+#            hide = ["/srv/repos/bot-company/.env"], groups = [] }
 
 # No model: publishes approved posts and records metrics.
 [accounts.publisher]

@@ -197,6 +197,10 @@ class Sessions:
             props += ["IPAddressDeny=any", f"IPAddressAllow=localhost {addr}"]
         for src, dst in self.mounts(e):
             props.append(f"BindReadOnlyPaths={src}:{dst}")
+        if e.hide:
+            props.append("InaccessiblePaths=" + " ".join(f"-{p}" for p in e.hide))
+        if e.groups:
+            props.append("SupplementaryGroups=" + " ".join(e.groups))
         argv = ["systemd-run", f"--unit={unit}", "--quiet", "--wait", "--pipe", "--collect",
                 f"--working-directory={ws}"]
         for p in props:

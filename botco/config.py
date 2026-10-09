@@ -62,6 +62,12 @@ class SessionEngine:
     workspace: str = "work/{task}"
     # Paths visible read-only: "/src" or "/src:/where/inside".
     ro: list[str] = field(default_factory=list)
+    # Paths made inaccessible inside the sandbox, e.g. credentials under a
+    # read-only home. Missing ones are fine.
+    hide: list[str] = field(default_factory=list)
+    # Extra groups for the session, e.g. to read a home directory that is
+    # only open to its group.
+    groups: list[str] = field(default_factory=list)
     max_minutes: int = 60
     # Internet access. Without it the sandbox still reaches the model.
     network: bool = True

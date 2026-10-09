@@ -495,11 +495,14 @@ def test_the_sandbox_command(env):
     world.cfg.accounts["dev"].engine.sandbox = True
     world.cfg.accounts["dev"].engine.network = False
     world.cfg.accounts["dev"].engine.ro = ["/srv/repos"]
+    world.cfg.accounts["dev"].engine.hide = ["/srv/repos/.ssh", "/srv/repos/.pi"]
+    world.cfg.accounts["dev"].engine.groups = ["users"]
     argv, envs, unit = runner.sessions.command("dev", 4, "do it")
     assert argv[0] == "systemd-run" and unit.startswith("botco-session-4-")
     props = [argv[i + 1] for i, a in enumerate(argv) if a == "-p"]
     assert "PrivateDevices=yes" in props and "IPAddressDeny=any" in props
     assert "BindReadOnlyPaths=/srv/repos:/srv/repos" in props
+    assert "InaccessiblePaths=-/srv/repos/.ssh -/srv/repos/.pi" in props and "SupplementaryGroups=users" in props
     assert any(p.startswith("ReadWritePaths=") and "work/4" in p for p in props)
 
 
