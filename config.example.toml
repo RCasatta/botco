@@ -47,7 +47,9 @@ engine = { kind = "turn", persona = "editor", model = "local", temperature = 0.6
 #            network = true, gpu = false,
 #            # credentials under a read-only path stay out of reach
 #            hide = ["/srv/repos/bot-company/.env"], groups = [],
-#            skills = ["/srv/skills"] }   # pi --skill: dirs with SKILL.md
+#            skills = ["/srv/skills"],    # pi --skill: dirs with SKILL.md
+#            pi_config = "/home/alice/.pi/agent",   # settings, extensions...
+#            agents_md = "/etc/botco/session-AGENTS.md" }   # instead of hers
 
 # No model: publishes approved posts and records metrics.
 [accounts.publisher]

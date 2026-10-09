@@ -483,6 +483,12 @@ def test_a_session_starts_from_a_person_s_pi_config(env, tmp_path):
     agent = runner.sessions.agent_dir(t.id)
     assert (agent / "skills" / "demo" / "SKILL.md").exists() and json.loads((agent / "models.json").read_text())["providers"]["botco"]
     assert "botco-pi-config" not in runner.sessions.prompt("dev", t)
+    # Server instructions replace the person's own.
+    server = tmp_path / "server-agents.md"
+    server.write_text("You run on a server.")
+    world.cfg.accounts["dev"].engine.agents_md = str(server)
+    runner.sessions.run(SessionJob("dev", t.id))
+    assert (agent / "AGENTS.md").read_text() == "You run on a server." and (agent / "skills" / "demo").exists()
 
 
 def test_a_person_can_stop_a_session(env):
@@ -529,6 +535,9 @@ def test_the_sandbox_command(env):
     assert "PrivateDevices=yes" in props and "IPAddressDeny=any" in props
     assert "BindReadOnlyPaths=/srv/repos:/srv/repos" in props
     assert "InaccessiblePaths=-/srv/repos/.ssh -/srv/repos/.pi" in props and "SupplementaryGroups=users" in props
+    world.cfg.accounts["dev"].engine.skills = ["/srv/skills"]
+    argv, envs, unit = runner.sessions.command("dev", 4, "do it")
+    assert "BindReadOnlyPaths=/srv/skills:/srv/skills" in [argv[i + 1] for i, a in enumerate(argv) if a == "-p"]
     world.cfg.accounts["dev"].engine.pi_config = "/srv/repos/.pi/agent"
     argv, envs, unit = runner.sessions.command("dev", 4, "do it")
     props = [argv[i + 1] for i, a in enumerate(argv) if a == "-p"]

@@ -68,14 +68,19 @@ class SessionEngine:
     # Extra groups for the session, e.g. to read a home directory that is
     # only open to its group.
     groups: list[str] = field(default_factory=list)
-    # Skill directories pi loads at launch (--skill): each directory with a
-    # SKILL.md under them is listed in pi's system prompt.
+    # Skill directories pi loads at launch (--skill), mounted read-only:
+    # each directory with a SKILL.md under them is listed in pi's system
+    # prompt.
     skills: list[str] = field(default_factory=list)
     # A pi agent directory (e.g. a person's ~/.pi/agent) whose settings,
     # instructions (AGENTS.md, SYSTEM.md...), extensions, skills, prompts and
     # themes each session starts from; never its credentials, models or
     # sessions.
     pi_config: str | None = None
+    # A file that sessions get as their AGENTS.md instead of the one in
+    # pi_config, e.g. instructions written for the server rather than a
+    # laptop.
+    agents_md: str | None = None
     max_minutes: int = 60
     # Internet access. Without it the sandbox still reaches the model.
     network: bool = True

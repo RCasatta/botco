@@ -37,12 +37,17 @@ log = logging.getLogger(__name__)
 SUMMARY_CHARS = 8000
 # What a session takes from `pi_config`: copied, not mounted, because pi
 # writes to its settings.
-PI_CONFIG = ("settings.json", "keybindings.json", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "SYSTEM.md",
-             "APPEND_SYSTEM.md", "extensions", "skills", "prompts", "themes")
+INSTRUCTIONS = ("AGENTS.md", "AGENTS.override.md", "CLAUDE.md")
+PI_CONFIG = ("settings.json", "keybindings.json", *INSTRUCTIONS, "SYSTEM.md", "APPEND_SYSTEM.md", "extensions",
+             "skills", "prompts", "themes")
 PI_CONFIG_MOUNT = "/run/botco-pi-config"
-# Runs in the sandbox: copy the readable config into the agent dir, then pi.
-COPY_CONFIG = ('src=$1; shift; for f in ' + " ".join(PI_CONFIG) + '; do rm -rf "$PI_CODING_AGENT_DIR/$f"; '
-               'if [ -e "$src/$f" ]; then cp -rL "$src/$f" "$PI_CODING_AGENT_DIR/" 2>/dev/null; fi; done; exec "$@"')
+
+
+def copy_config(names) -> str:
+    """Runs in the sandbox: copy the readable config into the agent dir,
+    then exec pi."""
+    return ('src=$1; shift; for f in ' + " ".join(names) + '; do rm -rf "$PI_CODING_AGENT_DIR/$f"; '
+            'if [ -e "$src/$f" ]; then cp -rL "$src/$f" "$PI_CODING_AGENT_DIR/" 2>/dev/null; fi; done; exec "$@"')
 LISTED_FILES = 40
 
 
@@ -129,6 +134,7 @@ class Sessions:
             out.append((str(lab.host_dir or lab.dir), "/run/botco-lab"))
         if e.pi_config:
             out.append((e.pi_config, PI_CONFIG_MOUNT))
+        out += [(p, p) for p in e.skills if (p, p) not in out]
         return out
 
     def prompt(self, account: str, t: Task) -> str:
@@ -193,7 +199,8 @@ class Sessions:
             env["CUDA_VISIBLE_DEVICES"] = ""
         if e.pi_config:
             src = e.pi_config if not e.sandbox else PI_CONFIG_MOUNT
-            pi = [shutil.which("bash") or "bash", "-c", COPY_CONFIG, "botco-pi-config", src, *pi]
+            names = [f for f in PI_CONFIG if not (e.agents_md and f in INSTRUCTIONS)]
+            pi = [shutil.which("bash") or "bash", "-c", copy_config(names), "botco-pi-config", src, *pi]
         if not e.sandbox:
             return pi, {**os.environ, **env}, None
         unit = f"botco-session-{task}-{int(time.time())}"
@@ -241,6 +248,10 @@ class Sessions:
         ws.mkdir(parents=True, exist_ok=True)
         agent.mkdir(parents=True, exist_ok=True)
         (agent / "models.json").write_text(self._models_json(e))
+        if e.agents_md:
+            for name in INSTRUCTIONS:
+                (agent / name).unlink(missing_ok=True)
+            shutil.copyfile(e.agents_md, agent / "AGENTS.md")
         before = files(ws)
         argv, env, unit = self.command(job.account, job.task, prompt)
         log.info("session on #%d for %s starts%s", job.task, job.account, f" as {unit}" if unit else "")
