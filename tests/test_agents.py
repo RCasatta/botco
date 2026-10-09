@@ -143,6 +143,9 @@ test -f "$PI_CODING_AGENT_DIR/models.json" || exit 3
 case "$*" in *"sleep please"*) sleep 30;; esac
 echo "patched" > fix.txt
 echo "Reproduced the crash and fixed it in fix.txt."
+test -f "$PI_CODING_AGENT_DIR/AGENTS.md" && echo "Read the owner's AGENTS.md."
+test -e "$PI_CODING_AGENT_DIR/auth.json" && echo "LEAKED auth.json"
+true
 """
 
 
@@ -465,6 +468,23 @@ def test_a_session_works_on_its_task_and_reports_a_summary(env):
     assert ("dev", task.id) in company.session_queue
 
 
+def test_a_session_starts_from_a_person_s_pi_config(env, tmp_path):
+    world, llm, runner, company = env
+    own = tmp_path / "home-pi"
+    (own / "skills" / "demo").mkdir(parents=True)
+    (own / "AGENTS.md").write_text("Use rg.")
+    (own / "skills" / "demo" / "SKILL.md").write_text("---\nname: demo\n---\n")
+    (own / "auth.json").write_text("{}")
+    world.cfg.accounts["dev"].engine.pi_config = str(own)
+    t, _ = Tracker(world).create("riccardo", "task", "Check the config", assignee="dev")
+    runner.sessions.run(SessionJob("dev", t.id))
+    text = world.store.comments(t.id)[-1].text
+    assert "Read the owner's AGENTS.md." in text and "LEAKED" not in text
+    agent = runner.sessions.agent_dir(t.id)
+    assert (agent / "skills" / "demo" / "SKILL.md").exists() and json.loads((agent / "models.json").read_text())["providers"]["botco"]
+    assert "botco-pi-config" not in runner.sessions.prompt("dev", t)
+
+
 def test_a_person_can_stop_a_session(env):
     world, llm, runner, company = env
     t, _ = Tracker(world).create("riccardo", "task", "Long job", "sleep please", assignee="dev")
@@ -495,6 +515,9 @@ def test_the_sandbox_command(env):
     world.cfg.accounts["dev"].engine.sandbox = False
     argv, envs, unit = runner.sessions.command("dev", 4, "do it")
     assert unit is None and argv[-2:] == ["--", "do it"] and "--no-session" in argv
+    world.cfg.accounts["dev"].engine.skills = ["/home/me/skills", "/opt/skills"]
+    argv, envs, unit = runner.sessions.command("dev", 4, "do it")
+    assert argv[-6:-2] == ["--skill", "/home/me/skills", "--skill", "/opt/skills"]
     world.cfg.accounts["dev"].engine.sandbox = True
     world.cfg.accounts["dev"].engine.network = False
     world.cfg.accounts["dev"].engine.ro = ["/srv/repos"]
@@ -506,6 +529,13 @@ def test_the_sandbox_command(env):
     assert "PrivateDevices=yes" in props and "IPAddressDeny=any" in props
     assert "BindReadOnlyPaths=/srv/repos:/srv/repos" in props
     assert "InaccessiblePaths=-/srv/repos/.ssh -/srv/repos/.pi" in props and "SupplementaryGroups=users" in props
+    world.cfg.accounts["dev"].engine.pi_config = "/srv/repos/.pi/agent"
+    argv, envs, unit = runner.sessions.command("dev", 4, "do it")
+    props = [argv[i + 1] for i, a in enumerate(argv) if a == "-p"]
+    assert "BindReadOnlyPaths=/srv/repos/.pi/agent:/run/botco-pi-config" in props
+    assert any(p.startswith("InaccessiblePaths=") and "-/run/botco-pi-config/sessions" in p for p in props)
+    i = argv.index("botco-pi-config")
+    assert argv[i - 2] == "-c" and argv[i + 1] == "/run/botco-pi-config" and argv[i + 2].endswith("fake-pi")
     assert any(p.startswith("ReadWritePaths=") and "work/4" in p for p in props)
 
 

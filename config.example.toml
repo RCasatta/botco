@@ -46,7 +46,8 @@ engine = { kind = "turn", persona = "editor", model = "local", temperature = 0.6
 #            ro = ["/srv/repos/bot-company"], max_minutes = 60,
 #            network = true, gpu = false,
 #            # credentials under a read-only path stay out of reach
-#            hide = ["/srv/repos/bot-company/.env"], groups = [] }
+#            hide = ["/srv/repos/bot-company/.env"], groups = [],
+#            skills = ["/srv/skills"] }   # pi --skill: dirs with SKILL.md
 
 # No model: publishes approved posts and records metrics.
 [accounts.publisher]

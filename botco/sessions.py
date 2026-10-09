@@ -35,6 +35,14 @@ from .world import World
 log = logging.getLogger(__name__)
 
 SUMMARY_CHARS = 8000
+# What a session takes from `pi_config`: copied, not mounted, because pi
+# writes to its settings.
+PI_CONFIG = ("settings.json", "keybindings.json", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "SYSTEM.md",
+             "APPEND_SYSTEM.md", "extensions", "skills", "prompts", "themes")
+PI_CONFIG_MOUNT = "/run/botco-pi-config"
+# Runs in the sandbox: copy the readable config into the agent dir, then pi.
+COPY_CONFIG = ('src=$1; shift; for f in ' + " ".join(PI_CONFIG) + '; do rm -rf "$PI_CODING_AGENT_DIR/$f"; '
+               'if [ -e "$src/$f" ]; then cp -rL "$src/$f" "$PI_CODING_AGENT_DIR/" 2>/dev/null; fi; done; exec "$@"')
 LISTED_FILES = 40
 
 
@@ -119,6 +127,8 @@ class Sessions:
         if self.w.lab is not None:
             lab = self.w.cfg.sources.lab
             out.append((str(lab.host_dir or lab.dir), "/run/botco-lab"))
+        if e.pi_config:
+            out.append((e.pi_config, PI_CONFIG_MOUNT))
         return out
 
     def prompt(self, account: str, t: Task) -> str:
@@ -147,7 +157,7 @@ class Sessions:
         sandbox = [f"Your working directory is {ws}. It is kept between sessions on this task, so earlier work "
                    "is still there."]
         if mounts:
-            sandbox.append("Read-only: " + ", ".join(dst for _, dst in mounts)
+            sandbox.append("Read-only: " + ", ".join(dst for _, dst in mounts if dst != PI_CONFIG_MOUNT)
                            + (" (/run/botco-lab is the lab notebook)." if w.lab is not None else ".")
                            + " These trees can hold hundreds of GB: look in specific directories (ls first), never "
                              "grep or find from their top.")
@@ -176,10 +186,14 @@ class Sessions:
         ws, agent = self.workspace(account, task), self.agent_dir(task)
         m = w.cfg.models[e.model]
         exe = shutil.which(e.cmd) or e.cmd
-        pi = [exe, "-p", "--provider", "botco", "--model", m.id, "--no-session", "--", prompt]
+        skills = [a for path in e.skills for a in ("--skill", path)]
+        pi = [exe, "-p", "--provider", "botco", "--model", m.id, "--no-session", *skills, "--", prompt]
         env = {"PI_CODING_AGENT_DIR": str(agent), "HOME": str(ws), "PI_OFFLINE": "1", "PI_TELEMETRY": "0"}
         if not e.gpu:
             env["CUDA_VISIBLE_DEVICES"] = ""
+        if e.pi_config:
+            src = e.pi_config if not e.sandbox else PI_CONFIG_MOUNT
+            pi = [shutil.which("bash") or "bash", "-c", COPY_CONFIG, "botco-pi-config", src, *pi]
         if not e.sandbox:
             return pi, {**os.environ, **env}, None
         unit = f"botco-session-{task}-{int(time.time())}"
@@ -199,8 +213,12 @@ class Sessions:
             props += ["IPAddressDeny=any", f"IPAddressAllow=localhost {addr}"]
         for src, dst in self.mounts(e):
             props.append(f"BindReadOnlyPaths={src}:{dst}")
-        if e.hide:
-            props.append("InaccessiblePaths=" + " ".join(f"-{p}" for p in e.hide))
+        hide = list(e.hide)
+        if e.pi_config:
+            # The person's own sessions and credentials stay out of reach.
+            hide += [f"{PI_CONFIG_MOUNT}/{f}" for f in ("sessions", "auth.json", "models-store.json")]
+        if hide:
+            props.append("InaccessiblePaths=" + " ".join(f"-{p}" for p in hide))
         if e.groups:
             props.append("SupplementaryGroups=" + " ".join(e.groups))
         argv = ["systemd-run", f"--unit={unit}", "--quiet", "--wait", "--pipe", "--collect",
