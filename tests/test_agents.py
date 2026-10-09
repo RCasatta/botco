@@ -451,7 +451,10 @@ def test_a_session_works_on_its_task_and_reports_a_summary(env):
     assert summary.author == "dev" and "Reproduced the crash" in summary.text
     assert "fix.txt (new)" in summary.text
     assert (Path(world.cfg.state_dir) / f"work/{task.id}/fix.txt").exists()
-    assert "Load the model with 2 GPUs." in runner.sessions.prompt("dev", task)
+    prompt = runner.sessions.prompt("dev", task)
+    assert "Load the model with 2 GPUs." in prompt and "never grep or find from their top" not in prompt
+    world.cfg.accounts["dev"].engine.ro = ["/srv"]
+    assert "never grep or find from their top" in runner.sessions.prompt("dev", task)
     # The author hears that the summary is in; dev does not wake itself.
     assert "dev's session ended (done" in llm.seen["strategist"][-1][-2]["content"]
     assert not company.session_queue

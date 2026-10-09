@@ -148,7 +148,9 @@ class Sessions:
                    "is still there."]
         if mounts:
             sandbox.append("Read-only: " + ", ".join(dst for _, dst in mounts)
-                           + (" (/run/botco-lab is the lab notebook)." if w.lab is not None else "."))
+                           + (" (/run/botco-lab is the lab notebook)." if w.lab is not None else ".")
+                           + " These trees can hold hundreds of GB: look in specific directories (ls first), never "
+                             "grep or find from their top.")
         sandbox.append("Internet access: " + ("yes." if e.network else "no, only the model server."))
         if not e.gpu:
             sandbox.append("There is no GPU here: do not load models or run benchmarks; people run benchmarks.")
