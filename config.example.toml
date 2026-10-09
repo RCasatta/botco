@@ -19,7 +19,7 @@ session_slots = 1   # ...sessions only one, so chat never waits behind them
 
 [accounts.riccardo]          # no engine: a person
 roles = ["owner"]
-zulip = "riccardo@example.com"
+zulip = "Riccardo"                   # Zulip full name, email or user id
 github = "RCasatta"
 
 [accounts.strategist]

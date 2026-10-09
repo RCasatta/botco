@@ -42,3 +42,14 @@ def test_breakers():
     assert "in a row" in b.allow("editor", "s", "t")
     b.observe("s", "t", from_bot=False)
     assert b.allow("editor", "s", "t") is None
+
+
+def test_find_member_by_email_name_or_id():
+    from botco.team import find_member
+    members = [{"user_id": 8, "full_name": "Riccardo Casatta", "email": "user8@zulip.example.com",
+                "delivery_email": None}]
+    assert find_member(members, "Riccardo Casatta")["user_id"] == 8
+    assert find_member(members, "8") and find_member(members, "USER8@zulip.example.com")
+    assert find_member(members, "riccardo@example.com") is None
+    members[0]["delivery_email"] = "riccardo@example.com"
+    assert find_member(members, "riccardo@example.com")

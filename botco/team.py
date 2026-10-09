@@ -27,6 +27,20 @@ class Blocked(Exception):
     """A circuit breaker stopped a message."""
 
 
+def find_member(members: list[dict], key: str) -> dict | None:
+    """The member a configured `zulip` names: an email, a full name or a
+    user id. Most realms hide real addresses from bots, so `email` is then
+    a placeholder like user8@zulip.example.com and the real one is only in
+    `delivery_email`, when the bot may see it."""
+    want = key.strip().lower()
+    for m in members:
+        keys = {str(m["user_id"]), m["full_name"].lower(), m["email"].lower(),
+                (m.get("delivery_email") or "").lower()}
+        if want in keys:
+            return m
+    return None
+
+
 class Team:
     """Bots are accounts with a zuliprc; people are accounts with a Zulip
     email. Anyone else in the realm can chat but holds no role."""
@@ -47,12 +61,13 @@ class Team:
         self._is_bot: dict[int, bool] = {}
         # People: account name -> (user id, full name).
         self.people: dict[str, tuple[int, str]] = {}
-        members = {m["email"].lower(): m for m in self.ops.get_members()["members"]}
+        humans = [m for m in self.ops.get_members()["members"] if not m["is_bot"] and m.get("is_active", True)]
         for name, account in cfg.accounts.items():
             if account.zulip:
-                m = members.get(account.zulip.lower())
+                m = find_member(humans, account.zulip)
                 if m is None:
-                    log.warning("account %s: no Zulip user %s", name, account.zulip)
+                    seen = ", ".join(f"{h['full_name']} (id {h['user_id']}, {h['email']})" for h in humans)
+                    log.warning("account %s: no Zulip user %s; the people botco sees: %s", name, account.zulip, seen)
                 else:
                     self.people[name] = (m["user_id"], m["full_name"])
 

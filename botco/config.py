@@ -80,7 +80,9 @@ class Account:
     engine: TurnEngine | SessionEngine | None = None
     # A bot's Zulip credentials. Turn accounts need one.
     zuliprc: Path | None = None
-    # A person's Zulip email, to know who wrote a message.
+    # A person in Zulip, to know who wrote a message: their email, full name
+    # or user id. The realm may hide emails from bots; a name or id always
+    # works.
     zulip: str | None = None
     github: str | None = None
 
