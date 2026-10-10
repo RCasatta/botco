@@ -10,6 +10,7 @@ in text.check_post.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -87,6 +88,66 @@ class X:
                 "replies": m.get("reply_count", 0), "views": m.get("impression_count", 0),
                 "url": f"https://x.com/{user.get('username', 'i')}/status/{post_id}"}
 
+    def following(self) -> list[dict]:
+        """The accounts we follow: id, username, name, followers."""
+        me = requests.get(f"{API}/users/me", auth=self.auth, timeout=30)
+        if not me.ok:
+            raise RuntimeError(f"X profile read failed: HTTP {me.status_code} {me.text[:300]}")
+        uid, out, token = me.json()["data"]["id"], [], None
+        while True:
+            params = {"max_results": 1000, "user.fields": "username,name,public_metrics"}
+            if token:
+                params["pagination_token"] = token
+            r = requests.get(f"{API}/users/{uid}/following", params=params, auth=self.auth, timeout=30)
+            if not r.ok:
+                raise RuntimeError(f"X following read failed: HTTP {r.status_code} {r.text[:300]}")
+            body = r.json()
+            out += [{"id": u["id"], "username": u["username"], "name": u["name"],
+                     "followers": u.get("public_metrics", {}).get("followers_count", 0)} for u in body.get("data", [])]
+            token = body.get("meta", {}).get("next_token")
+            if not token:
+                return out
+
+    def recent_posts(self, usernames: list[str], since: str, limit: int) -> list[dict]:
+        """At most `limit` original posts (no reposts or replies) by these
+        accounts since `since` (ISO time, at most 7 days ago), newest first.
+        The window is cut in slices of 10 posts each (the search's minimum),
+        so a busy last hour does not crowd out the rest of the day; long
+        account lists take one search per group the query length allows."""
+        groups, group = [], []
+        for u in usernames:
+            if group and len(" OR ".join(f"from:{g}" for g in [*group, u])) > 400:
+                groups.append(group)
+                group = []
+            group.append(u)
+        if group:
+            groups.append(group)
+        start, end = datetime.fromisoformat(since), datetime.now(timezone.utc) - timedelta(seconds=30)
+        out = []
+        for i, g in enumerate(groups):
+            budget = (limit - len(out)) // (len(groups) - i)
+            slices = budget // 10
+            for j in range(slices):
+                params = {
+                    "query": "(" + " OR ".join(f"from:{u}" for u in g) + ") -is:retweet -is:reply",
+                    "start_time": (start + (end - start) * j / slices).isoformat(timespec="seconds"),
+                    "end_time": (start + (end - start) * (j + 1) / slices).isoformat(timespec="seconds"),
+                    "max_results": min(budget // slices, 100), "sort_order": "relevancy",
+                    "tweet.fields": "created_at,public_metrics", "expansions": "author_id",
+                    "user.fields": "username,name"}
+                r = requests.get(f"{API}/tweets/search/recent", params=params, auth=self.auth, timeout=30)
+                if not r.ok:
+                    raise RuntimeError(f"X search failed: HTTP {r.status_code} {r.text[:300]}")
+                body = r.json()
+                users = {u["id"]: u for u in body.get("includes", {}).get("users", [])}
+                for t in body.get("data", []):
+                    u, m = users.get(t["author_id"], {}), t.get("public_metrics", {})
+                    out.append({"id": t["id"], "username": u.get("username", "?"), "name": u.get("name", ""),
+                                "text": t["text"], "created_at": t.get("created_at", ""),
+                                "views": m.get("impression_count", 0), "likes": m.get("like_count", 0),
+                                "replies": m.get("reply_count", 0), "reposts": m.get("retweet_count", 0)})
+        return sorted(out, key=lambda p: p["created_at"], reverse=True)[:limit]
+
     def post_numbers(self, ids: list[str]) -> dict[str, PostNumbers]:
         """Views, likes and the rest for our posts, 100 per request. Deleted
         posts are left out."""
@@ -117,6 +178,12 @@ class DryRunX:
 
     def read_post(self, post_id: str) -> dict:
         raise RuntimeError("X is in dry run: posts on X cannot be read")
+
+    def following(self) -> list[dict]:
+        return []
+
+    def recent_posts(self, usernames: list[str], since: str, limit: int) -> list[dict]:
+        return []
 
 
 def make(dry_run: bool, env_file: Path) -> X | DryRunX:

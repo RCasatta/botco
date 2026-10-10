@@ -3,11 +3,14 @@ model; the X publisher is the only component that writes outside botco."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from . import text as T
-from .tracker import Tracker
+from .store import External
+from .tracker import Refused, Tracker
 from .world import World, quote
+
+WATCH = "x-watch"  # the schedule name of the daily watch task
 
 
 class XPublisher:
@@ -28,6 +31,7 @@ class XPublisher:
     def tick(self) -> None:
         self.publish()
         self.record_metrics()
+        self.watch()
 
     def publish(self) -> None:
         w, cfg = self.w, self.cfg
@@ -87,6 +91,53 @@ class XPublisher:
         lines += self.record_post_metrics()
         w.team.send(self.cfg.account, w.cfg.streams.metrics, "followers", "\n".join(lines), check=False)
 
+    def watch(self) -> None:
+        """Once a day, read what the accounts we follow posted since the
+        last time, and hand the list to `watch_for` as a task: it picks the
+        posts worth a reply. The posts are kept, so reading one is free."""
+        w, cfg = self.w, self.cfg
+        now, today = w.now(), w.today()
+        if not cfg.watch or now.time() < cfg.watch_time or w.store.get("watch_tried") == today:
+            return
+        w.store.put("watch_tried", today)
+        last = w.store.get("watch_since")
+        since = max(datetime.fromisoformat(last) if last else now - timedelta(days=1), now - timedelta(days=6))
+        try:
+            followed = [u for u in w.x.following() if u["username"].lower() not in
+                        {e.lower() for e in cfg.watch_exclude}]
+            posts = w.x.recent_posts([u["username"] for u in followed],
+                                     since.astimezone(timezone.utc).isoformat(timespec="seconds"), cfg.watch_posts)
+        except Exception as e:
+            w.team.notify(f":warning: Reading the posts of the accounts we follow failed: {e}")
+            return
+        w.store.put("watch_since", now.isoformat(timespec="seconds"))
+        if not posts:
+            return
+        followers = {u["username"]: u["followers"] for u in followed}
+        lines = []
+        for p in posts:
+            ref = f"x:{p['id']}"
+            w.store.put_external(External(ref, f"@{p['username']} ({p['name']})", "posted",
+                                          f"https://x.com/{p['username']}/status/{p['id']}", p["text"], [],
+                                          p["created_at"]))
+            lines.append(f"- {ref} @{p['username']} ({followers.get(p['username'], 0)} followers), "
+                         f"{age(p['created_at'], now)} ago, {p['views']} views, {p['likes']} likes, "
+                         f"{p['replies']} replies:\n  {' '.join(p['text'].split())[:500]}")
+        tracker = Tracker(w)
+        if old := tracker.find_open(schedule=WATCH):
+            w.store.close_task(old.id, "replaced")
+            tracker.post(cfg.account, old, "Closed: a newer list replaces it.")
+        body = (f"{len(posts)} posts by the {len(followed)} accounts we follow, since "
+                f"{since:%a %H:%M}, newest first. Pick the few where a reply from us adds something real to the "
+                "conversation (our own measurements, a trade-off we hit, a precise answer), and get a reply "
+                "drafted for each (kind reply, the post's ref in refs); close this task when done. Skip what is "
+                "old, off-topic or only loosely related.\n\n" + "\n".join(lines))
+        try:
+            tracker.create(WATCH, "task", f"Posts worth a reply, {today}", body, assignee=cfg.watch_for,
+                           schedule=WATCH, system=True)
+        except Refused as e:
+            w.team.notify(f":warning: Could not hand over the posts worth a reply: {e}")
+
     def record_post_metrics(self) -> list[str]:
         """Read the numbers of the posts published in the last
         `metrics_days` days; the best and the worst of them, for #metrics."""
@@ -109,6 +160,14 @@ class XPublisher:
         shown = read if len(read) <= 2 else [read[0], read[-1]]
         return [f"{'Most' if i == 0 else 'Fewest'} views of the last {self.cfg.metrics_days} days: #{t.id}, "
                 f"{metrics_text(n)}: {t.body[:80]}" for i, (t, n) in enumerate(shown)]
+
+
+def age(created_at: str, now: datetime) -> str:
+    try:
+        hours = (now - datetime.fromisoformat(created_at.replace("Z", "+00:00"))).total_seconds() / 3600
+    except ValueError:
+        return "?"
+    return f"{hours:.0f}h" if hours < 48 else f"{hours / 24:.0f}d"
 
 
 def metrics_text(n) -> str:

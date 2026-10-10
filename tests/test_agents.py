@@ -176,7 +176,8 @@ def raw_config(tmp_path: Path) -> dict:
                      "validate": "x_post", "approve": ["editor", "owner"], "max_revisions": 3, "sink": "x"},
             "plan": {"stream": "plan", "create": ["strategist"], "edit": ["strategist"], "one_open": True},
             "reply": {"stream": "replies", "create": ["writer", "strategist"], "edit": ["writer", "strategist"],
-                      "validate": "x_post", "approve": ["editor"], "posted_by": "owner", "close": ["owner"]},
+                      "validate": "x_post", "approve": ["editor"], "posted_by": "owner", "close": ["owner"],
+                      "max_per_day": 3},
             "task": {"stream": "tasks", "create": ["strategist", "owner"]},
         },
         "schedules": {
@@ -455,6 +456,55 @@ def test_a_reply_is_drafted_approved_and_handed_to_the_owner(env):
     company.handle(message(OWNER, "replies", "reply #1", "/done", 71))
     assert world.store.task(1).resolution == "done"
     assert not world.store.published(), "posting by hand is not publishing"
+
+
+def test_the_strategist_gets_the_followed_accounts_posts_once_a_day(make):
+    world, llm, runner, company = make(**{"sinks.x": {"watch": True, "watch_time": "08:00", "watch_posts": 50,
+                                                      "watch_exclude": ["RCasatta"]}})
+
+    class WatchX(DryRunX):
+        asked = []
+
+        def following(self):
+            return [{"id": "1", "username": "sudoingX", "name": "Sudo su", "followers": 37444},
+                    {"id": "2", "username": "RCasatta", "name": "Riccardo", "followers": 3830}]
+
+        def recent_posts(self, usernames, since, limit):
+            self.asked.append((usernames, since, limit))
+            return [{"id": str(100 + i), "username": "sudoingX", "name": "Sudo su", "text": f"Post {i} on KV cache",
+                     "created_at": "2026-10-05T05:00:00Z", "views": 900, "likes": 12, "replies": 4, "reposts": 1}
+                    for i in range(5)]
+
+        def read_post(self, post_id):
+            raise AssertionError("watched posts are read from the cache")
+
+    world.x = WatchX()
+    world.at = world.at.replace(hour=8, minute=1)
+    company.tick()
+    (usernames, since, limit), = WatchX.asked
+    assert usernames == ["sudoingX"] and limit == 50 and since == "2026-10-04T06:01:00+00:00"
+    (t,) = world.store.open_tasks("task")
+    assert (t.assignee, t.schedule, t.depth) == ("strategist", "x-watch", 0)
+    assert "- x:100 @sudoingX (37444 followers), 1h ago, 900 views, 12 likes, 4 replies:\n  Post 0 on KV cache" in t.body
+    drain(world, company)
+    assert company.pending["strategist"][0].task == t.id
+    company.pending["strategist"].clear()
+
+    texts = ["Six-bit KV cache halved it on our two 16 GB cards at 160K.",
+             "We measured decode speed falling past 128K context on a 27B model.",
+             "Quantizing the cache to 4 bits cost us accuracy on long recall tasks.",
+             "Prefix caching saved most of our prefill time in agent loops."]
+    llm.script["strategist"] = [[call("read", ref="x:100")]
+                                + [call("write", kind="reply", body=b, refs=[f"x:{100 + i}"]) for i, b in enumerate(texts)]
+                                + [call("write", ref=f"#{t.id}", state="done")], "picked"]
+    runner.run_turn(Turn("strategist", [Trigger("task", task=t.id, content="created")]))
+    results = tool_results(llm, "strategist")
+    assert "@sudoingX (Sudo su)" in results[0] and "Post 0 on KV cache" in results[0]
+    assert [r.startswith("created") for r in results[1:5]] == [True, True, True, False]
+    assert "3 reply tasks were created today, the limit is 3" in results[4]
+    assert world.store.task(t.id).resolution == "done"
+    company.tick()
+    assert len(WatchX.asked) == 1, "once a day"
 
 
 def test_x_refs():

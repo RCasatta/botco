@@ -108,6 +108,9 @@ class Tracker:
             if made >= w.cfg.dispatcher.max_new_tasks_per_day:
                 raise Refused(f"{actor} already created {made} tasks today, the limit is "
                               f"{w.cfg.dispatcher.max_new_tasks_per_day}")
+            if k.max_per_day is not None and (n := w.store.created_of(k.name, w.midnight())) >= k.max_per_day:
+                raise Refused(f"{n} {k.name} tasks were created today, the limit is {k.max_per_day}; "
+                              "keep the best ones for tomorrow")
         assignee = self._account(assignee) or (actor if actor in w.cfg.accounts else None)
         self._open_cap(assignee)
         body = self._clean(kind, body)

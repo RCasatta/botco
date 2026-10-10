@@ -148,6 +148,8 @@ class Kind:
     # Once approved, a person with this role posts it by hand (an X reply,
     # which the API may not post) and closes it with /done.
     posted_by: str | None = None
+    # Tasks of this kind created a day, by anyone but people.
+    max_per_day: int | None = None
 
 
 @dataclass
@@ -200,6 +202,15 @@ class XSink:
     # Posts published in this many days get their numbers read every day,
     # each one a paid read.
     metrics_days: int = 7
+    # Once a day, read what the accounts we follow posted since the last
+    # time (at most watch_posts posts, each a paid read) and give the list to
+    # watch_for in a task, to pick the posts worth a reply.
+    watch: bool = False
+    watch_time: time = time(8, 0)
+    watch_posts: int = 50
+    watch_for: str = "strategist"
+    # Followed accounts left out, by username.
+    watch_exclude: list[str] = field(default_factory=list)
     dry_run: bool = True
     env_file: Path = Path("x.env")
 
@@ -317,6 +328,8 @@ class Config:
         for s in self.schedules.values():
             if s.kind not in self.kinds or s.assignee not in self.accounts:
                 raise ValueError(f"config: schedule {s.name} names an unknown kind or assignee")
+        if self.x.watch and self.x.watch_for not in self.accounts:
+            raise ValueError("config: [sinks.x] watch_for names an unknown account")
         pub = self.accounts.get(self.publisher)
         if not pub or not pub.zuliprc:
             raise ValueError(f"config: [accounts.{self.publisher}] with a zuliprc is required")
@@ -360,8 +373,9 @@ def parse(raw: dict, base: Path) -> Config:
     x = dict(raw.get("sinks", {}).get("x", {}))
     if "times" in x:
         x["times"] = [_time(t) for t in x["times"]]
-    if "metrics_time" in x:
-        x["metrics_time"] = _time(x["metrics_time"])
+    for k in ("metrics_time", "watch_time"):
+        if k in x:
+            x[k] = _time(x[k])
     if "env_file" in x:
         x["env_file"] = rel(x["env_file"])
     else:

@@ -100,6 +100,7 @@ approve = ["editor"]
 posted_by = "owner"
 close = ["owner"]
 max_revisions = 3
+max_per_day = 3                # reply drafts a day
 
 [kinds.plan]
 stream = "plan"
@@ -138,6 +139,11 @@ min_gap_minutes = 60
 max_chars = 280
 metrics_time = "23:30"
 metrics_days = 7               # posts whose numbers are read daily (paid reads)
+watch = false                  # daily: posts by the accounts we follow...
+watch_time = "08:00"
+watch_posts = 50               # ...at most this many (paid reads)...
+watch_for = "strategist"       # ...listed in a task for it, to pick replies
+watch_exclude = []             # followed usernames to leave out
 dry_run = true
 env_file = "x.env"
 

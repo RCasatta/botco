@@ -388,6 +388,10 @@ class Store:
         rows = self.db.execute("SELECT * FROM comments WHERE task_id = ? ORDER BY id DESC LIMIT ?", (task_id, limit))
         return list(reversed([Comment(**dict(r)) for r in rows]))
 
+    def created_of(self, kind: str, since: str) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM tasks WHERE kind = ? AND created_at >= ?",
+                               (kind, since)).fetchone()[0]
+
     def created_by(self, author: str, since: str) -> int:
         return self.db.execute("SELECT COUNT(*) FROM tasks WHERE author = ? AND created_at >= ?",
                                (author, since)).fetchone()[0]
