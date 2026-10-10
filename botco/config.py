@@ -194,6 +194,9 @@ class XSink:
     min_gap_minutes: int = 60
     max_chars: int = 280
     metrics_time: time = time(23, 30)
+    # Posts published in this many days get their numbers read every day,
+    # each one a paid read.
+    metrics_days: int = 7
     dry_run: bool = True
     env_file: Path = Path("x.env")
 

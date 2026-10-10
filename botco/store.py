@@ -91,6 +91,18 @@ CREATE TABLE IF NOT EXISTS metrics (
     posts INTEGER,
     taken_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS post_metrics (
+    task_id INTEGER NOT NULL,              -- a published task
+    day TEXT NOT NULL,
+    views INTEGER NOT NULL,
+    likes INTEGER NOT NULL,
+    reposts INTEGER NOT NULL,
+    replies INTEGER NOT NULL,
+    quotes INTEGER NOT NULL,
+    bookmarks INTEGER NOT NULL,
+    taken_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, day)
+);
 CREATE TABLE IF NOT EXISTS kv (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
@@ -426,6 +438,18 @@ class Store:
 
     def metrics(self, limit: int = 30) -> list[sqlite3.Row]:
         return list(self.db.execute("SELECT * FROM metrics ORDER BY day DESC LIMIT ?", (limit,)))
+
+    def add_post_metrics(self, task_id: int, day: str, n) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO post_metrics(task_id, day, views, likes, reposts, replies, quotes, bookmarks,"
+            " taken_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, day, n.views, n.likes, n.reposts, n.replies, n.quotes, n.bookmarks, self.now()))
+
+    def post_metrics(self) -> dict[int, sqlite3.Row]:
+        """The latest numbers of each published task that has any."""
+        rows = self.db.execute("SELECT * FROM post_metrics p WHERE day = (SELECT MAX(day) FROM post_metrics"
+                               " WHERE task_id = p.task_id)")
+        return {r["task_id"]: r for r in rows}
 
     def has_metrics(self, day: str) -> bool:
         return self.db.execute("SELECT 1 FROM metrics WHERE day = ?", (day,)).fetchone() is not None

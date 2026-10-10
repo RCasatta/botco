@@ -125,6 +125,7 @@ times = ["10:00", "14:00", "19:00"]
 min_gap_minutes = 60
 max_chars = 280
 metrics_time = "23:30"
+metrics_days = 7               # posts whose numbers are read daily (paid reads)
 dry_run = true
 env_file = "x.env"
 

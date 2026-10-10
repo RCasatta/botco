@@ -377,6 +377,48 @@ def test_a_reaction_records_the_reacting_person_s_review(env):
     assert world.store.task(t.id).resolution == "rejected"
 
 
+def test_the_posts_numbers_are_read_once_a_day(env):
+    from botco.xclient import Numbers, PostNumbers
+
+    class FakeX:
+        def __init__(self):
+            self.n, self.asked = 0, []
+
+        def post(self, text):
+            self.n += 1
+            return f"x{self.n}"
+
+        def numbers(self):
+            return Numbers(12, 18, 20)
+
+        def post_numbers(self, ids):
+            self.asked.append(ids)
+            return {i: PostNumbers(100 * int(i[1:]), int(i[1:]), 0, 1, 0, 0) for i in ids if i != "x2"}
+
+    world, llm, runner, company = env
+    world.x = FakeX()
+    tracker = Tracker(world)
+    for n, text in enumerate(["Six-bit KV cache halves VRAM at long context.",
+                              "Speculative decoding needs a draft model that agrees often.",
+                              "A 27B model at 4 bits fits two 16 GB cards with room for context."]):
+        t = post(world, text)
+        tracker.review("riccardo", world.store.task(t.id), "approve")
+        world.at = world.at.replace(hour=10 + 4 * n, minute=1)
+        company.x.publish()
+    old = world.store.published()[-1]
+    world.store.update_task(old.id, closed_at="2026-09-01T10:00:00+02:00")  # outside the window
+    world.at = world.at.replace(hour=23, minute=31)
+    company.tick()
+    assert world.x.asked == [["x3", "x2"]], "one read, recent posts only"
+    assert set(world.store.post_metrics()) == {3}, "a post X did not return is skipped"
+    (msg,) = world.team.sent("publisher", "metrics")
+    assert "**12** followers" in msg["content"] and "Most views of the last 7 days: #3, 300 views, 3 likes" in msg["content"]
+    text = situation(world, Turn("strategist", [Trigger("heartbeat")]))
+    assert "(300 views, 3 likes, 0 reposts, 1 replies, 0 quotes, 0 bookmarks on 2026-10-05) A 27B model" in text
+    company.tick()
+    assert len(world.x.asked) == 1, "once a day"
+
+
 # guardrails on creating tasks
 
 def test_creation_is_limited_by_depth_ref_and_quota(make):

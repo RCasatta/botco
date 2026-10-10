@@ -82,6 +82,37 @@ class XPublisher:
         prev = w.store.metrics(1)
         w.store.add_metrics(today, n.followers, n.following, n.posts)
         delta = f" ({n.followers - prev[0]['followers']:+d})" if prev else ""
-        w.team.send(self.cfg.account, w.cfg.streams.metrics, "followers",
-                    f"{today}: **{n.followers}** followers{delta}, {n.posts} posts, "
-                    f"{w.published_on(today)} published today.", check=False)
+        lines = [f"{today}: **{n.followers}** followers{delta}, {n.posts} posts, "
+                 f"{w.published_on(today)} published today."]
+        lines += self.record_post_metrics()
+        w.team.send(self.cfg.account, w.cfg.streams.metrics, "followers", "\n".join(lines), check=False)
+
+    def record_post_metrics(self) -> list[str]:
+        """Read the numbers of the posts published in the last
+        `metrics_days` days; the best and the worst of them, for #metrics."""
+        w = self.w
+        since = (w.now() - timedelta(days=self.cfg.metrics_days)).isoformat(timespec="seconds")
+        recent = [t for t in w.store.published(200) if t.closed_at and t.closed_at >= since and t.x_id != "dry-run"]
+        if not recent:
+            return []
+        try:
+            numbers = w.x.post_numbers([t.x_id for t in recent])
+        except Exception as e:
+            w.team.notify(f":warning: Reading the posts' numbers failed: {e}")
+            return []
+        read = [(t, numbers[t.x_id]) for t in recent if t.x_id in numbers]
+        for t, n in read:
+            w.store.add_post_metrics(t.id, w.today(), n)
+        if not read:
+            return []
+        read.sort(key=lambda tn: tn[1].views, reverse=True)
+        shown = read if len(read) <= 2 else [read[0], read[-1]]
+        return [f"{'Most' if i == 0 else 'Fewest'} views of the last {self.cfg.metrics_days} days: #{t.id}, "
+                f"{metrics_text(n)}: {t.body[:80]}" for i, (t, n) in enumerate(shown)]
+
+
+def metrics_text(n) -> str:
+    """`1234 views, 5 likes, 1 repost, 0 replies, 0 quotes, 2 bookmarks`, from
+    PostNumbers or a post_metrics row."""
+    get = (lambda k: n[k]) if not hasattr(n, "views") else (lambda k: getattr(n, k))
+    return ", ".join(f"{get(k)} {k}" for k in ("views", "likes", "reposts", "replies", "quotes", "bookmarks"))

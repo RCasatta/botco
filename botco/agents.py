@@ -22,6 +22,7 @@ from . import tools
 from .config import TurnEngine
 from .llm import LLMDown
 from .sessions import SessionDone, SessionJob, Sessions
+from .sinks import metrics_text
 from .store import Task
 from .tools import Trigger, Turn
 from .world import World, quote
@@ -150,8 +151,9 @@ def standing_section(w: World) -> str | None:
     return "\n\n".join(parts) or None
 
 
-def published_line(t: Task) -> str:
-    return f"- [{(t.closed_at or '')[:16]}] {t.body}"
+def published_line(t: Task, numbers=None) -> str:
+    seen = f" ({metrics_text(numbers)} on {numbers['day']})" if numbers else ""
+    return f"- [{(t.closed_at or '')[:16]}]{seen} {t.body}"
 
 
 def publishing_section(w: World) -> str | None:
@@ -163,7 +165,9 @@ def publishing_section(w: World) -> str | None:
            f"approved by {' and '.join(kinds[0].approve) or 'nobody'}."]
     recent = w.store.published(10)
     if recent:
-        pub.append("Recently published, newest first:\n" + "\n".join(published_line(t) for t in recent))
+        numbers = w.store.post_metrics()
+        pub.append("Recently published, newest first, with their numbers on X when read (once a day):\n"
+                   + "\n".join(published_line(t, numbers.get(t.id)) for t in recent))
     return "## Publishing\n" + "\n".join(pub)
 
 
