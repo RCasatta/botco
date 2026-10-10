@@ -17,7 +17,7 @@ from typing import Callable
 
 from .external import ExternalError, summary
 from .policy import Ref, parse_ref
-from .store import Task
+from .store import External, Task
 from .team import Blocked
 from .tracker import Refused, Tracker
 from .world import World, quote
@@ -149,6 +149,20 @@ def external(w: World, ref: Ref) -> str:
     return summary(cached, 6000)
 
 
+def x_post(w: World, ref: Ref) -> str:
+    """A post on X. Each read is paid, so it is read once and kept."""
+    cached = w.store.external(ref.text)
+    if cached is None:
+        try:
+            p = w.x.read_post(str(ref.number))
+        except Exception as e:  # noqa: BLE001 - the model sees why
+            raise ToolError(f"cannot read {ref.text}: {e}") from None
+        w.store.put_external(External(ref.text, f"@{p['username']} ({p['name']})", "posted", p["url"], p["text"],
+                                      [], p["created_at"]))
+        cached = w.store.external(ref.text)
+    return f"{ref.text}: {cached.title} on {cached.updated_at[:16]} ({cached.url}):\n{quote(cached.body)}"
+
+
 # the tools
 
 def find(w: World, turn: Turn, a: dict) -> str:
@@ -198,6 +212,10 @@ def read(w: World, turn: Turn, a: dict) -> str:
         text = external(w, ref)
         local = next((t for t in w.store.open_tasks() if ref.text in t.refs), None)
         return text + (f"\n\nLocal task: #{local.id}" if local else "\n\nNo open local task refers to it.")
+    if ref.kind == "x":
+        text = x_post(w, ref)
+        local = [t for t in w.store.open_tasks() if ref.text in t.refs]
+        return text + "".join(f"\nOpen task about it: #{t.id} {t.kind}: {t.title}" for t in local)
     if ref.kind == "lab":
         if w.lab is None:
             raise ToolError("there is no lab notebook")
@@ -238,7 +256,7 @@ def write(w: World, turn: Turn, a: dict) -> str:
         return (f"created #{t.id} in zulip:{t.stream}/{t.topic}; it waits on "
                 f"{', '.join(waiting.accounts) or 'nobody'} ({waiting.why})")
     ref = _ref(a)
-    if ref.external or ref.kind == "lab":
+    if ref.read_only:
         raise ToolError(f"{ref.text} is read-only")
     t = _task(w, ref)
     if a.get("kind") and a["kind"] != t.kind:
@@ -266,7 +284,7 @@ def comment(w: World, turn: Turn, a: dict) -> str:
     ref = _ref(a)
     text = fix_mentions(w, (a.get("text") or "").strip())
     verdict, behalf = a.get("verdict") or None, a.get("on_behalf_of")
-    if ref.external or ref.kind == "lab":
+    if ref.read_only:
         raise ToolError(f"{ref.text} is read-only")
     tracker = Tracker(w)
     if ref.kind == "zulip" and w.store.task_by_topic(ref.stream, ref.topic) is None:
@@ -326,6 +344,7 @@ I = {"type": "integer"}
 LIST = {"type": "array", "items": S}
 
 REFS = ("Refs: #42 (a task), gh:owner/repo#12 and gl:group/proj#7 (external issues, read-only), "
+        "x:123 or a post's x.com link (a post on X, read-only), "
         "lab:FILE.md#Section (lab notebook, read-only), zulip:stream/topic (a chat topic).")
 
 TOOLS = [

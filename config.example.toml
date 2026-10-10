@@ -89,6 +89,18 @@ approve = ["editor", "owner"]  # one from each role
 max_revisions = 3              # then waits on the owner
 sink = "x"
 
+# A reply to a post on X: the API may only reply to posts that mention us,
+# so once approved the owner posts it by hand and closes it with /done.
+[kinds.reply]
+stream = "replies"
+create = ["writer", "strategist"]
+edit = ["writer", "strategist"]
+validate = "x_post"
+approve = ["editor"]
+posted_by = "owner"
+close = ["owner"]
+max_revisions = 3
+
 [kinds.plan]
 stream = "plan"
 create = ["strategist"]

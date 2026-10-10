@@ -2,7 +2,8 @@
 
 X's API is pay-per-use (about $0.015 per post, $0.01 per profile read), so
 this module makes as few calls as possible: one per post, one profile read a
-day, and one read a day of the latest posts' numbers. Posts with links cost much more and are refused earlier, by the checks
+day, one read a day of the latest posts' numbers, and one read per post
+an agent asks to read. Posts with links cost much more and are refused earlier, by the checks
 in text.check_post.
 """
 
@@ -69,6 +70,23 @@ class X:
         m = r.json()["data"]["public_metrics"]
         return Numbers(m["followers_count"], m["following_count"], m["tweet_count"])
 
+    def read_post(self, post_id: str) -> dict:
+        """A post on X: its author, text, time and numbers."""
+        r = requests.get(f"{API}/tweets/{post_id}", params={
+            "tweet.fields": "created_at,public_metrics,conversation_id", "expansions": "author_id",
+            "user.fields": "username,name"}, auth=self.auth, timeout=30)
+        if not r.ok:
+            raise RuntimeError(f"X post read failed: HTTP {r.status_code} {r.text[:300]}")
+        body = r.json()
+        if "data" not in body:
+            raise RuntimeError(f"no such post on X: {post_id}")
+        t, user = body["data"], (body.get("includes", {}).get("users") or [{}])[0]
+        m = t.get("public_metrics", {})
+        return {"username": user.get("username", "?"), "name": user.get("name", ""), "text": t["text"],
+                "created_at": t.get("created_at", ""), "likes": m.get("like_count", 0),
+                "replies": m.get("reply_count", 0), "views": m.get("impression_count", 0),
+                "url": f"https://x.com/{user.get('username', 'i')}/status/{post_id}"}
+
     def post_numbers(self, ids: list[str]) -> dict[str, PostNumbers]:
         """Views, likes and the rest for our posts, 100 per request. Deleted
         posts are left out."""
@@ -96,6 +114,9 @@ class DryRunX:
 
     def post_numbers(self, ids: list[str]) -> dict[str, PostNumbers]:
         return {}
+
+    def read_post(self, post_id: str) -> dict:
+        raise RuntimeError("X is in dry run: posts on X cannot be read")
 
 
 def make(dry_run: bool, env_file: Path) -> X | DryRunX:

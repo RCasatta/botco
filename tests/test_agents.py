@@ -175,6 +175,8 @@ def raw_config(tmp_path: Path) -> dict:
             "post": {"stream": "drafts", "create": ["writer", "strategist"], "edit": ["writer", "strategist"],
                      "validate": "x_post", "approve": ["editor", "owner"], "max_revisions": 3, "sink": "x"},
             "plan": {"stream": "plan", "create": ["strategist"], "edit": ["strategist"], "one_open": True},
+            "reply": {"stream": "replies", "create": ["writer", "strategist"], "edit": ["writer", "strategist"],
+                      "validate": "x_post", "approve": ["editor"], "posted_by": "owner", "close": ["owner"]},
             "task": {"stream": "tasks", "create": ["strategist", "owner"]},
         },
         "schedules": {
@@ -417,6 +419,48 @@ def test_the_posts_numbers_are_read_once_a_day(env):
     assert "(300 views, 3 likes, 0 reposts, 1 replies, 0 quotes, 0 bookmarks on 2026-10-05) A 27B model" in text
     company.tick()
     assert len(world.x.asked) == 1, "once a day"
+
+
+def test_a_reply_is_drafted_approved_and_handed_to_the_owner(env):
+    world, llm, runner, company = env
+
+    class ReadX(DryRunX):
+        reads = 0
+
+        def read_post(self, post_id):
+            ReadX.reads += 1
+            return {"username": "bob", "name": "Bob", "text": "Is a 6-bit KV cache worth it at 128K?",
+                    "created_at": "2026-10-05T07:00:00.000Z", "likes": 3, "replies": 1, "views": 200,
+                    "url": f"https://x.com/bob/status/{post_id}"}
+
+    world.x = ReadX()
+    llm.script["writer"] = [
+        [call("read", ref="https://x.com/bob/status/555?s=20"), call("read", ref="x:555")],
+        [call("write", kind="reply", body="On our two 16 GB cards it halved the cache at 160K with no quality "
+                                           "drop we could measure.", refs=["x:555"], note="source: KV.md")],
+        "drafted",
+    ]
+    llm.script["editor"] = [[call("comment", ref="#1", text="Fits the question.", verdict="approve")], "ok"]
+    company.handle(message(OWNER, "replies", "ideas", "@**writer** draft a reply to https://x.com/bob/status/555", 70))
+    pump(world, runner, company)
+    first, second = tool_results(llm, "writer")[:2]
+    assert "@bob (Bob)" in first and "6-bit KV cache worth it" in first and ReadX.reads == 1, "read once, then kept"
+    t = world.store.task(1)
+    assert (t.kind, t.refs, t.stream) == ("reply", ["x:555"], "replies")
+    w = waits(world, 1)
+    assert w.ready and w.accounts == ["riccardo"] and "by hand" in w.why
+    (handoff,) = [m["content"] for m in world.team.sent("publisher", "replies", "reply #1") if "@**Riccardo**" in m["content"]]
+    assert "Post it as a reply to @bob (Bob): https://x.com/bob/status/555" in handoff
+    assert "```text\nOn our two 16 GB cards" in handoff and "`/done`" in handoff
+    company.handle(message(OWNER, "replies", "reply #1", "/done", 71))
+    assert world.store.task(1).resolution == "done"
+    assert not world.store.published(), "posting by hand is not publishing"
+
+
+def test_x_refs():
+    assert parse_ref("https://x.com/bob/status/555?s=20").text == "x:555"
+    assert parse_ref("https://twitter.com/bob/status/7").text == "x:7"
+    assert parse_ref("x:9").read_only and not parse_ref("x:9").external
 
 
 # guardrails on creating tasks

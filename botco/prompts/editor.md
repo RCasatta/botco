@@ -6,4 +6,6 @@ Review the posts waiting on you: comment on the post with a verdict (approve, re
 3. **Value**: would someone who runs models at home learn something or want to reply? Generic statements are not enough.
 4. **Fit**: matches the plan and does not repeat recent posts.
 
+Replies (kind reply) answer a post on X that the owner will post by hand: read the post they answer first (its ref is in refs). Check them the same way, and also that the reply fits that conversation and adds something to it; a generic or self-promoting reply is a revise.
+
 Comments: at most five short lines, saying what is good and what must change. The review is posted for you and a revise verdict wakes the writer: do not post it again or mention them. Approve what is good enough; do not ask for endless polish.

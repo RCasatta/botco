@@ -145,6 +145,9 @@ class Kind:
     sink: str | None = None
     # A new task of this kind closes the open one.
     one_open: bool = False
+    # Once approved, a person with this role posts it by hand (an X reply,
+    # which the API may not post) and closes it with /done.
+    posted_by: str | None = None
 
 
 @dataclass
@@ -303,11 +306,14 @@ class Config:
             if r.unaddressed and r.unaddressed not in self.accounts:
                 raise ValueError(f"config: role {r.name} routes to unknown account {r.unaddressed!r}")
         for k in self.kinds.values():
-            for role in [*k.approve, *(k.create or []), *(k.edit or []), *(k.close or [])]:
+            for role in [*k.approve, *(k.create or []), *(k.edit or []), *(k.close or []),
+                         *([k.posted_by] if k.posted_by else [])]:
                 if role not in self.roles:
                     raise ValueError(f"config: kind {k.name} names unknown role {role!r}")
             if k.sink not in (None, "x"):
                 raise ValueError(f"config: kind {k.name} has unknown sink {k.sink!r}")
+            if k.sink and k.posted_by:
+                raise ValueError(f"config: kind {k.name} has both a sink and posted_by")
         for s in self.schedules.values():
             if s.kind not in self.kinds or s.assignee not in self.accounts:
                 raise ValueError(f"config: schedule {s.name} names an unknown kind or assignee")

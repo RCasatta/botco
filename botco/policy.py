@@ -21,13 +21,15 @@ REF_RE = re.compile(
     r"|gh:(?P<gh>[\w.-]+/[\w.-]+)#(?P<gh_n>\d+)"
     r"|gl:(?P<gl>[\w./-]+)#(?P<gl_n>\d+)"
     r"|lab:(?P<lab>[^#]+)(?:#(?P<lab_section>.*))?"
+    r"|x:(?P<x>\d+)"
+    r"|https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/[\w]+/status/(?P<x_url>\d+)\S*"
     r"|zulip:(?P<stream>[^/]+)/(?P<topic>.+))$"
 )
 
 
 @dataclass
 class Ref:
-    kind: str  # task, gh, gl, lab, zulip
+    kind: str  # task, gh, gl, lab, x, zulip
     text: str
     task: int = 0
     repo: str = ""
@@ -39,7 +41,12 @@ class Ref:
 
     @property
     def external(self) -> bool:
+        """An issue on GitHub or GitLab."""
         return self.kind in ("gh", "gl")
+
+    @property
+    def read_only(self) -> bool:
+        return self.kind in ("gh", "gl", "lab", "x")
 
 
 def parse_ref(text: str) -> Ref:
@@ -48,8 +55,8 @@ def parse_ref(text: str) -> Ref:
         t = f"#{t}"
     m = REF_RE.match(t)
     if not m:
-        raise ValueError(f"not a ref: {text!r}; use #42, gh:owner/repo#12, gl:group/proj#7, lab:FILE.md#Section "
-                         "or zulip:stream/topic")
+        raise ValueError(f"not a ref: {text!r}; use #42, gh:owner/repo#12, gl:group/proj#7, lab:FILE.md#Section, "
+                         "x:123 (or a post's x.com link) or zulip:stream/topic")
     g = m.groupdict()
     if g["task"]:
         return Ref("task", t, task=int(g["task"]))
@@ -57,6 +64,9 @@ def parse_ref(text: str) -> Ref:
         return Ref("gh", t, repo=g["gh"], number=int(g["gh_n"]))
     if g["gl"]:
         return Ref("gl", t, repo=g["gl"], number=int(g["gl_n"]))
+    if g["x"] or g["x_url"]:
+        n = g["x"] or g["x_url"]
+        return Ref("x", f"x:{n}", number=int(n))
     if g["lab"]:
         return Ref("lab", t, path=g["lab"].strip(), section=(g["lab_section"] or "").strip())
     return Ref("zulip", t, stream=g["stream"].lstrip("#").strip(), topic=g["topic"].strip())
@@ -137,6 +147,8 @@ class Policy:
         owner = t.assignee or t.author
         owner = [owner] if owner in self.cfg.accounts else []
         if not kind.approve:
+            if kind.posted_by:
+                return Waiting(self.holders(kind.posted_by), f"the {kind.posted_by}, to post it by hand", ready=True)
             return Waiting(owner, "its assignee")
         reviews = store.reviews(t.id)
         current = [r for r in reviews if r.body_hash == t.hash]
@@ -155,6 +167,8 @@ class Policy:
                 return Waiting(self.holders(role), f"the {role}'s approval")
         if kind.sink:
             return Waiting([], f"ready, for the {kind.sink} publisher", ready=True)
+        if kind.posted_by:
+            return Waiting(self.holders(kind.posted_by), f"the {kind.posted_by}, to post it by hand", ready=True)
         return Waiting(owner, "approved, to be closed", ready=True)
 
     def approvals(self, store: Store, t: Task) -> str:

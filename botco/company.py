@@ -46,6 +46,7 @@ log = logging.getLogger(__name__)
 APPROVE = {"check", "white_check_mark", "heavy_check_mark", "check_mark", "+1", "thumbs_up", "like"}
 REJECT = {"x", "cross_mark", "-1", "thumbs_down", "no_entry", "cross"}
 VERDICT_COMMANDS = {"approve": "approve", "revise": "revise", "reject": "reject"}
+CLOSE_COMMANDS = {"done": "done", "drop": "dropped"}
 
 HELP = """\
 Talk to the team in plain words, anywhere. A message that mentions a bot \
@@ -57,6 +58,7 @@ waits on. For example: "make another post about quantization", "#5 is good", \
 Your own reviews, in a task's topic or with its number:
 - `/approve [#42] [comments]`, `/revise [#42] what to change`, `/reject [#42] [why]`
 - or react ✅ / ❌ on a task's message
+- `/done [#42]` closes a task as done (e.g. a reply you posted by hand), `/drop [#42]` gives it up
 - `/stop #42` ends a running session early; its workspace is kept
 
 Commands in #ops that work even when the model is down:
@@ -193,9 +195,27 @@ class Company:
         if w.store.get(key) == state:
             return
         w.store.put(key, state)
+        kind = self.policy.kind(t.kind)
+        if kind.posted_by and waiting.ready:
+            self.tracker.post(self.cfg.publisher, t, self.by_hand(account, t))
+            return
         how = (" Reply `/approve`, `/revise <what to change>` or `/reject`, or react ✅ / ❌."
-               if self.policy.may(account, "approve", self.policy.kind(t.kind)) else "")
+               if self.policy.may(account, "approve", kind) else "")
         self.tracker.post(self.cfg.publisher, t, f"{w.team.mention(account)} #{t.id} waits on you ({waiting.why}).{how}")
+
+    def by_hand(self, account: str, t: Task) -> str:
+        """An approved text for a person to post by hand: ready to copy, with
+        the posts on X it answers."""
+        w = self.w
+        targets = []
+        for r in t.refs:
+            ref = parse_ref(r)
+            if ref.kind == "x":
+                cached = w.store.external(ref.text)
+                targets.append(f"{cached.title}: {cached.url}" if cached else f"https://x.com/i/status/{ref.number}")
+        to = ("Post it as a reply to " + "; ".join(targets)) if targets else "Post it on X"
+        return (f"{w.team.mention(account)} #{t.id} is approved. {to}, by hand, then send `/done` here "
+                f"(or `/drop`):\n```text\n{t.body}\n```")
 
     def on_task_changed(self, ev: TaskChanged) -> None:
         t = self.w.store.task(ev.task)
@@ -379,7 +399,7 @@ class Company:
         if content.startswith("/"):
             words = content[1:].split()
             word = words[0].lower() if words else ""
-            if word in VERDICT_COMMANDS or word == "stop":
+            if word in VERDICT_COMMANDS or word in CLOSE_COMMANDS or word == "stop":
                 self.slash(word, words[1:], stream, topic, author, msg)
                 return True
         if stream != self.cfg.streams.ops:
@@ -424,6 +444,9 @@ class Company:
                 reply(f"No session is running on #{t.id}.")
             return
         try:
+            if word in CLOSE_COMMANDS:
+                self.tracker.close(author, t, CLOSE_COMMANDS[word])
+                return
             self.tracker.review(author, t, VERDICT_COMMANDS[word], " ".join(rest), msg_id=msg["id"], post=False)
         except Refused as e:
             reply(f"Not recorded: {e}.")

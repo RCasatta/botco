@@ -70,6 +70,7 @@ def system_prompt(w: World) -> str:
         rule = (f"needs an approval of its current body from each of: {', '.join(k.approve)}" if k.approve
                 else "waits on its assignee until they close it")
         extra = (", then the publisher posts it to X" if k.sink == "x" else "") + \
+                (f", then the {k.posted_by} posts it on X by hand" if k.posted_by else "") + \
                 ("; only one is open at a time" if k.one_open else "")
         kinds.append(f"  - {k.name}: {rule}{extra}. Topics in #{k.stream}.")
     team = prompt("team").format(
