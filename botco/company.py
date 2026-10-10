@@ -197,15 +197,18 @@ class Company:
         w.store.put(key, state)
         kind = self.policy.kind(t.kind)
         if kind.posted_by and waiting.ready:
+            # The text alone in a message of its own, so that copying the
+            # whole message on a phone copies exactly what to post.
             self.tracker.post(self.cfg.publisher, t, self.by_hand(account, t))
+            self.tracker.post(self.cfg.publisher, t, t.body)
             return
         how = (" Reply `/approve`, `/revise <what to change>` or `/reject`, or react ✅ / ❌."
                if self.policy.may(account, "approve", kind) else "")
         self.tracker.post(self.cfg.publisher, t, f"{w.team.mention(account)} #{t.id} waits on you ({waiting.why}).{how}")
 
     def by_hand(self, account: str, t: Task) -> str:
-        """An approved text for a person to post by hand: ready to copy, with
-        the posts on X it answers."""
+        """What to do with an approved text a person posts by hand: the
+        posts on X it answers. The text itself follows in its own message."""
         w = self.w
         targets = []
         for r in t.refs:
@@ -214,8 +217,8 @@ class Company:
                 cached = w.store.external(ref.text)
                 targets.append(f"{cached.title}: {cached.url}" if cached else f"https://x.com/i/status/{ref.number}")
         to = ("Post it as a reply to " + "; ".join(targets)) if targets else "Post it on X"
-        return (f"{w.team.mention(account)} #{t.id} is approved. {to}, by hand, then send `/done` here "
-                f"(or `/drop`):\n```text\n{t.body}\n```")
+        return (f"{w.team.mention(account)} #{t.id} is approved. {to}, by hand, with the text in the next message; "
+                "then send `/done` here (or `/drop`).")
 
     def on_task_changed(self, ev: TaskChanged) -> None:
         t = self.w.store.task(ev.task)

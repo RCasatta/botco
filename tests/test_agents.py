@@ -450,9 +450,10 @@ def test_a_reply_is_drafted_approved_and_handed_to_the_owner(env):
     assert (t.kind, t.refs, t.stream) == ("reply", ["x:555"], "replies")
     w = waits(world, 1)
     assert w.ready and w.accounts == ["riccardo"] and "by hand" in w.why
-    (handoff,) = [m["content"] for m in world.team.sent("publisher", "replies", "reply #1") if "@**Riccardo**" in m["content"]]
-    assert "Post it as a reply to @bob (Bob): https://x.com/bob/status/555" in handoff
-    assert "```text\nOn our two 16 GB cards" in handoff and "`/done`" in handoff
+    *_, handoff, text = [m["content"] for m in world.team.sent("publisher", "replies", "reply #1")]
+    assert "@**Riccardo**" in handoff and "Post it as a reply to @bob (Bob): https://x.com/bob/status/555" in handoff
+    assert "`/done`" in handoff and "On our two" not in handoff
+    assert text == world.store.task(1).body, "the text alone, to copy whole"
     company.handle(message(OWNER, "replies", "reply #1", "/done", 71))
     assert world.store.task(1).resolution == "done"
     assert not world.store.published(), "posting by hand is not publishing"
