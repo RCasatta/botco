@@ -5,16 +5,20 @@ publisher. A note is a kind 1 event signed with the account's key (BIP-340
 Schnorr over secp256k1); any relay that accepts it serves it.
 
     python -m botco.nostr keygen nostr.env
-    python -m botco.nostr profile nostr.env --name "Local AI bot" --about "..."
+    python -m botco.nostr profile nostr.env --name "Local AI bot" --about "..." --picture-file profile.jpg
 
 keygen writes a new key to nostr.env (never printed) and shows the public
 key; profile publishes the account's name and description, flagged as a bot.
+A picture file is first uploaded to a Blossom server, authorized by the
+account's key, which gives it a URL.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import mimetypes
 import json
 import logging
 import sys
@@ -22,6 +26,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import requests
 from coincurve import PrivateKey, PublicKeyXOnly
 from websockets.sync.client import connect
 
@@ -30,7 +35,8 @@ from .xclient import read_env
 log = logging.getLogger(__name__)
 
 KEY = "NOSTR_SECRET_KEY"
-RELAYS = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net", "wss://relay.nostr.band"]
+BLOSSOM = "https://blossom.primal.net"
+RELAYS = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net", "wss://relay.snort.social"]
 
 # bech32 (BIP-173), for nsec/npub/note strings.
 CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -132,6 +138,23 @@ def send(event: dict, relays: list[str], timeout: float = 10) -> dict[str, str]:
     return out
 
 
+def upload(key: PrivateKey, path: Path, server: str = BLOSSOM) -> str:
+    """Store a file on a Blossom server (BUD-02); its URL."""
+    data = path.read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    auth = sign_event(key, 24242, f"Upload {path.name}",
+                      [["t", "upload"], ["x", sha], ["expiration", str(int(time.time()) + 600)]])
+    r = requests.put(f"{server.rstrip('/')}/upload", data=data, timeout=60, headers={
+        "Authorization": "Nostr " + base64.b64encode(json.dumps(auth).encode()).decode(),
+        "Content-Type": mimetypes.guess_type(path.name)[0] or "application/octet-stream"})
+    if not r.ok:
+        raise RuntimeError(f"upload to {server} failed: HTTP {r.status_code} {r.text[:200]}")
+    blob = r.json()
+    if blob.get("sha256") != sha:
+        raise RuntimeError(f"{server} stored something else: {blob}")
+    return blob["url"]
+
+
 @dataclass
 class Posted:
     id: str
@@ -189,7 +212,9 @@ def main() -> None:
     p.add_argument("env_file", type=Path)
     p.add_argument("--name", required=True)
     p.add_argument("--about", required=True)
-    p.add_argument("--picture", default="")
+    p.add_argument("--picture", default="", help="the picture's URL")
+    p.add_argument("--picture-file", type=Path, help="a picture to upload first")
+    p.add_argument("--blossom", default=BLOSSOM, help="where to upload it")
     p.add_argument("--website", default="")
     p.add_argument("--relay", action="append", help="instead of the default relays")
     args = ap.parse_args()
@@ -203,6 +228,9 @@ def main() -> None:
         print(bech32_encode("npub", bytes.fromhex(public_hex(key))))
         return
     nostr = Nostr(read_env(args.env_file), args.relay or RELAYS, [])
+    if args.picture_file:
+        args.picture = upload(nostr.key, args.picture_file, args.blossom)
+        print(f"picture: {args.picture}")
     meta = {"name": args.name, "display_name": args.name, "about": args.about, "bot": True}
     if args.picture:
         meta["picture"] = args.picture

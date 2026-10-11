@@ -221,7 +221,7 @@ class NostrSink:
 
     env_file: Path = Path("nostr.env")  # NOSTR_SECRET_KEY=nsec1...
     relays: list[str] = field(default_factory=lambda: ["wss://relay.damus.io", "wss://nos.lol",
-                                                       "wss://relay.primal.net", "wss://relay.nostr.band"])
+                                                       "wss://relay.primal.net", "wss://relay.snort.social"])
     # Hashtags appended to each note: discovery on Nostr goes through them.
     tags: list[str] = field(default_factory=lambda: ["localai"])
     dry_run: bool = False

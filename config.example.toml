@@ -152,7 +152,7 @@ env_file = "x.env"
 # with `python -m botco.nostr profile nostr.env --name ... --about ...`.
 # [sinks.nostr]
 # env_file = "nostr.env"
-# relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net", "wss://relay.nostr.band"]
+# relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net", "wss://relay.snort.social"]
 # tags = ["localai"]
 
 [streams]
