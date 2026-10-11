@@ -216,6 +216,18 @@ class XSink:
 
 
 @dataclass
+class NostrSink:
+    """Mirrors what the X publisher posts to Nostr relays, for free."""
+
+    env_file: Path = Path("nostr.env")  # NOSTR_SECRET_KEY=nsec1...
+    relays: list[str] = field(default_factory=lambda: ["wss://relay.damus.io", "wss://nos.lol",
+                                                       "wss://relay.primal.net", "wss://relay.nostr.band"])
+    # Hashtags appended to each note: discovery on Nostr goes through them.
+    tags: list[str] = field(default_factory=lambda: ["localai"])
+    dry_run: bool = False
+
+
+@dataclass
 class LabConfig:
     # The lab notebook: markdown reports of the experiments. None: no notebook.
     dir: Path | None = None
@@ -279,6 +291,7 @@ class Config:
     schedules: dict[str, Schedule] = field(default_factory=dict)
     dispatcher: Dispatcher = field(default_factory=Dispatcher)
     x: XSink = field(default_factory=XSink)
+    nostr: NostrSink | None = None
     sources: Sources = field(default_factory=Sources)
     streams: Streams = field(default_factory=Streams)
     breakers: Breakers = field(default_factory=Breakers)
@@ -381,6 +394,12 @@ def parse(raw: dict, base: Path) -> Config:
     else:
         x["env_file"] = rel("x.env")
 
+    nostr = raw.get("sinks", {}).get("nostr")
+    if nostr is not None:
+        nostr = dict(nostr)
+        nostr["env_file"] = rel(nostr.get("env_file", "nostr.env"))
+        nostr = NostrSink(**nostr)
+
     src = dict(raw.get("sources", {}))
     lab = dict(src.pop("lab", {}))
     for k in ("dir", "host_dir"):
@@ -401,6 +420,7 @@ def parse(raw: dict, base: Path) -> Config:
         schedules=schedules,
         dispatcher=Dispatcher(**_times(raw.get("dispatcher", {}), "active_from", "active_to")),
         x=XSink(**x),
+        nostr=nostr,
         sources=sources,
         streams=Streams(**raw.get("streams", {})),
         breakers=Breakers(**raw.get("breakers", {})),

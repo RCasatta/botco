@@ -103,6 +103,14 @@ CREATE TABLE IF NOT EXISTS post_metrics (
     taken_at TEXT NOT NULL,
     PRIMARY KEY (task_id, day)
 );
+CREATE TABLE IF NOT EXISTS mirrors (
+    task_id INTEGER NOT NULL,              -- a published task
+    platform TEXT NOT NULL,                -- nostr
+    ref TEXT NOT NULL,                     -- its id there
+    url TEXT NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (task_id, platform)
+);
 CREATE TABLE IF NOT EXISTS kv (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
@@ -454,6 +462,13 @@ class Store:
         rows = self.db.execute("SELECT * FROM post_metrics p WHERE day = (SELECT MAX(day) FROM post_metrics"
                                " WHERE task_id = p.task_id)")
         return {r["task_id"]: r for r in rows}
+
+    def add_mirror(self, task_id: int, platform: str, ref: str, url: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO mirrors(task_id, platform, ref, url, at) VALUES (?, ?, ?, ?, ?)",
+                        (task_id, platform, ref, url, self.now()))
+
+    def mirrors(self, task_id: int) -> list[sqlite3.Row]:
+        return list(self.db.execute("SELECT * FROM mirrors WHERE task_id = ? ORDER BY platform", (task_id,)))
 
     def has_metrics(self, day: str) -> bool:
         return self.db.execute("SELECT 1 FROM metrics WHERE day = ?", (day,)).fetchone() is not None

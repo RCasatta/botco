@@ -6,7 +6,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from . import xclient
+from . import nostr, xclient
 from .agents import Runner
 from .breakers import Breakers
 from .company import Company
@@ -36,7 +36,7 @@ def main() -> None:
     owners = Policy(cfg).holders("owner") if "owner" in cfg.roles else []
     store = Store(cfg.state_dir / "botco.sqlite3", owner=owners[0] if owners else "owner")
     team = Team(cfg, Breakers(cfg.breakers))
-    world = World(cfg, store, team, xclient.make(cfg.x.dry_run, cfg.x.env_file))
+    world = World(cfg, store, team, xclient.make(cfg.x.dry_run, cfg.x.env_file), nostr=nostr.make(cfg.nostr))
     llms = {name: LLM(m) for name, m in cfg.models.items()}
     Company(world, Runner(world, llms)).run()
 

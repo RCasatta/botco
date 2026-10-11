@@ -147,6 +147,14 @@ watch_exclude = []             # followed usernames to leave out
 dry_run = true
 env_file = "x.env"
 
+# Mirror every post the X publisher sends to Nostr (free). Make the key
+# with `python -m botco.nostr keygen nostr.env`, then publish the profile
+# with `python -m botco.nostr profile nostr.env --name ... --about ...`.
+# [sinks.nostr]
+# env_file = "nostr.env"
+# relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net", "wss://relay.nostr.band"]
+# tags = ["localai"]
+
 [streams]
 published = "published"
 metrics = "metrics"

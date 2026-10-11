@@ -33,12 +33,14 @@ class TaskChanged:
 
 class World:
     def __init__(self, cfg: Config, store: Store, team: Team, x, inbox: queue.Queue | None = None,
-                 issues: Issues | None = None):
+                 issues: Issues | None = None, nostr=None):
         self.cfg = cfg
         self.store = store
         store.clock = self.now
         self.team = team
         self.x = x
+        # Where published posts are mirrored, if anywhere.
+        self.nostr = nostr
         self.policy = Policy(cfg)
         self.issues = issues if issues is not None else Issues(cfg.sources)
         lab = cfg.sources.lab

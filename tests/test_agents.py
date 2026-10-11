@@ -380,6 +380,32 @@ def test_a_reaction_records_the_reacting_person_s_review(env):
     assert world.store.task(t.id).resolution == "rejected"
 
 
+def test_published_posts_are_mirrored_to_nostr(env):
+    from botco.nostr import Posted
+
+    class FakeNostr:
+        fail = False
+
+        def post(self, text):
+            if self.fail:
+                raise RuntimeError("no relay accepted the note")
+            return Posted("ab" * 32, ["wss://relay"], {})
+
+    world, llm, runner, company = env
+    world.nostr = FakeNostr()
+    for hour, text in ((10, "Six-bit KV cache halves VRAM at long context."),
+                       (14, "Speculative decoding needs a draft model that agrees often.")):
+        t = post(world, text)
+        Tracker(world).review("riccardo", world.store.task(t.id), "approve")
+        world.at = world.at.replace(hour=hour, minute=1)
+        company.x.publish()
+        world.nostr.fail = True
+    first, second = world.team.sent("publisher", "published")
+    assert "Nostr: https://njump.me/note1" in first["content"] and world.store.mirrors(1)[0]["ref"] == "ab" * 32
+    assert "not on Nostr" in second["content"] and world.store.task(2).resolution == "done", "X stands alone"
+    assert any("Mirroring #2 to Nostr failed" in m["content"] for m in world.team.sent("publisher", "ops"))
+
+
 def test_the_posts_numbers_are_read_once_a_day(env):
     from botco.xclient import Numbers, PostNumbers
 

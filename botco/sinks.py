@@ -64,9 +64,26 @@ class XPublisher:
             return
         tracker.close(cfg.account, t, "done", by_sink=True, x_id=x_id)
         where = "dry run, not actually posted" if x_id == "dry-run" else f"https://x.com/i/status/{x_id}"
+        where += self.mirror(t)
         w.team.send(cfg.account, w.cfg.streams.published, today,
                     f"Published #{t.id} ({where}):\n{quote(t.body)}", check=False)
         tracker.post(cfg.account, t, f"Published ({where}).")
+
+    def mirror(self, t) -> str:
+        """Post the same text on Nostr; `, Nostr: <link>` for the message,
+        or why not. A failure here never undoes the post on X."""
+        w = self.w
+        if w.nostr is None:
+            return ""
+        try:
+            posted = w.nostr.post(t.body)
+        except Exception as e:
+            w.team.notify(f":warning: Mirroring #{t.id} to Nostr failed: {e}")
+            return ", not on Nostr"
+        if not posted.accepted:
+            return ", Nostr: dry run"
+        w.store.add_mirror(t.id, "nostr", posted.id, posted.link)
+        return f", Nostr: {posted.link}"
 
     def record_metrics(self) -> None:
         w = self.w

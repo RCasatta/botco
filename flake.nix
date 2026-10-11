@@ -11,7 +11,7 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         py = pkgs.python3;
-        deps = ps: [ ps.zulip ps.requests ps.requests-oauthlib ];
+        deps = ps: [ ps.zulip ps.requests ps.requests-oauthlib ps.coincurve ps.websockets ];
       in
       {
         packages.default = py.pkgs.buildPythonApplication {
