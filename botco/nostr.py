@@ -8,7 +8,8 @@ Schnorr over secp256k1); any relay that accepts it serves it.
     python -m botco.nostr profile nostr.env --name "Local AI bot" --about "..." --picture-file profile.jpg
 
 keygen writes a new key to nostr.env (never printed) and shows the public
-key; profile publishes the account's name and description, flagged as a bot.
+key; profile publishes the account's name and description, flagged as a bot,
+and the relays it writes to.
 A picture file is first uploaded to a Blossom server, authorized by the
 account's key, which gives it a URL.
 """
@@ -236,9 +237,12 @@ def main() -> None:
         meta["picture"] = args.picture
     if args.website:
         meta["website"] = args.website
-    event = sign_event(nostr.key, 0, json.dumps(meta, ensure_ascii=False), [])
-    for relay, result in send(event, nostr.relays).items():
-        print(f"{relay}: {result}")
+    # The profile, then the relays the account writes to (NIP-65): clients
+    # read an account's notes from those, not only from their own relays.
+    for event in (sign_event(nostr.key, 0, json.dumps(meta, ensure_ascii=False), []),
+                  sign_event(nostr.key, 10002, "", [["r", r] for r in nostr.relays])):
+        for relay, result in send(event, nostr.relays).items():
+            print(f"kind {event['kind']} {relay}: {result}")
     print(nostr.npub())
 
 
